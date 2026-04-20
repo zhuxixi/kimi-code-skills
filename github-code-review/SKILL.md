@@ -413,6 +413,43 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 - 此步骤必须执行。只要有资格审查通过，无论是否发现问题，都必须发布评论
 - 如果 `gh pr review` 命令失败，向用户报告错误详情，不重复尝试
 
+### Step 10: 启动 Background Watcher（可选）
+
+此步骤在发现问题后启动后台监控，自动检测 PR 的新 commit。
+
+#### 启动条件
+
+同时满足：
+1. Step 6 过滤后存在 `status="open"` 的 issues（即还有未解决的问题）
+2. 当前为 Round-1 首次审查，或用户手动触发的增量审查（非 watcher 触发的 re-entry）
+
+如果上述条件不满足（无 open issues，或当前是 watcher 触发的 re-entry 但已无问题）：
+- 不启动 watcher
+- 如果是 re-entry 且全部解决 → 输出 "All issues resolved ✓"
+- 进程正常结束
+
+#### 操作步骤
+
+1. 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取当前 head SHA 作为 `base_sha`
+
+2. 使用 `Agent` + `run_in_background=true` 启动 pr-watcher agent：
+   - `description`: `"PR change watcher"`（简短，用于 TaskList 显示）
+   - `prompt`: 包含 PR 编号、仓库 owner/repo、`base_sha`、轮询间隔（默认 300s）、最大等待时间（默认 3600s）
+   - `timeout`: 3600（1 小时，与 `print_wait_ceiling_s` 配合）
+
+3. 输出到终端：
+   ```
+   Found {N} open issues. Started background watcher to monitor fixes.
+   Will re-review automatically when new commits are pushed.
+   Task ID: {task_id}
+   ```
+
+#### 不启动 watcher 的场景
+
+- 首次审查无问题 → 已输出 "No issues found"，进程结束
+- re-entry 后增量审查无 open issues → 已输出 "All issues resolved ✓"，进程结束
+- PR 在 Step 7 被判定为已关闭/已合并 → 已在 Step 7 停止
+
 ## HIGH SIGNAL 原则
 
 ### 只标记以下问题
@@ -608,6 +645,13 @@ reason 字段应为 "logic" 或 "security"。
     - 构建包含 HTML Comment metadata 的结构化评论 body
     - 使用 `Shell` 执行 `gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md`
     - 向用户确认完成
+
+12. **Step 10: 启动 Background Watcher（可选）**
+    - 条件：Step 6 过滤后存在 `status="open"` 的 issues，且当前为首次审查或手动触发的增量审查
+    - 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid` 获取当前 head SHA
+    - 使用 `Agent` + `run_in_background=true` 启动 pr-watcher agent
+    - 输出 watcher 启动信息
+    - 不满足条件 → 不启动 watcher，正常结束
 
 ## gh 命令参考
 
