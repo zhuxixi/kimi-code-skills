@@ -1,0 +1,29 @@
+# Session History
+
+> 开发会话历史记录 | Development Session History
+>
+> 由 summary-and-commit skill 自动生成和更新
+> Auto-generated and updated by summary-and-commit skill
+
+---
+
+## Recent Sessions (Last 5)
+
+### Session {session_number} - {date}
+
+- {summary_line_1}
+- {summary_line_2}
+- {summary_line_3}
+
+### Session {session_number-1} - {date}
+
+[...]
+
+## Earlier Sessions
+
+- **Session {n}** ({date}): Brief description...
+- **Session {n-1}** ({date}): Brief description...
+
+---
+
+*Total: {total} sessions | Last Updated: {timestamp}*
