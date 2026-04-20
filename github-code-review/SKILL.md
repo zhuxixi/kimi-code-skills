@@ -57,6 +57,53 @@ review pull request owner/repo#101
 
 ## 执行流程
 
+### Step 0: 审查类型判断
+
+在正式审查之前，先判断本次审查的类型：首次完整审查、用户手动触发的增量审查、还是 watcher 完成后的自动 re-entry。
+
+#### 0.1 检测 re-entry 场景
+
+检查用户输入是否包含 `<system-reminder>` 且 mention "Background task completed" 和 "PR change watcher"：
+- 如果是 → 直接跳转至【Re-entry 处理】章节，跳过 Step 1-9
+- 如果不是 → 继续正常流程
+
+#### 0.2 检测 previous review metadata
+
+使用 `Shell` 执行：
+```bash
+gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+```
+
+筛选 Kimi Code CLI 发布的 review 评论：
+1. 评论 body 包含 `"Generated with Kimi Code CLI"`
+2. 评论 body 包含 `"<!-- kimi-cr-meta"`
+
+按 `submitted_at` 排序，取最新一条。使用正则表达式提取 HTML Comment 中的 JSON metadata：
+```
+<!-- kimi-cr-meta\n(.*?)\n-->
+```
+
+解析 metadata 字段：`round`, `head_sha`, `previous_head_sha`, `issues`。
+
+#### 0.3 判断分支
+
+**有 previous review metadata？**
+- 是 → 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取当前 head SHA
+  - 当前 SHA == `previous_head_sha` → **无新 commit**
+    - 输出：`"No new commits since Round-{round} review. Previous issues may still be open."`
+    - 列出仍 open 的 issues
+    - 不启动 watcher，结束
+  - 当前 SHA != `previous_head_sha` → **有新 commit**
+    - 标记当前为 `Round = round + 1`
+    - 提取 `previous_issues = issues`
+    - 进入【增量审查流程】，跳过 Step 1-9
+- 否 → 首次审查 → 走完整流程（Round = 1）
+
+#### 0.4 异常情况
+
+- Metadata 提取失败（格式损坏或正则不匹配）→ 输出警告，fallback 到完整流程
+- `gh pr view --json reviews` 失败 → 视为无 previous review，继续正常流程
+
 ### Step 1: PR 资格审查
 
 使用 `Shell` 执行 `gh pr view <PR>` 和 `gh pr view <PR> --comments` 检查 PR 状态。
@@ -415,28 +462,39 @@ reason 字段应为 "logic" 或 "security"。
 
 当用户触发此 Skill 时，遵循以下精确执行流程：
 
-1. **提取 PR 编号**
+1. **Step 0: 审查类型判断**
+   - 检查用户输入是否为 watcher 触发的 re-entry（`<system-reminder>` + "PR change watcher"）
+   - 如果是 re-entry → 跳转至【Re-entry 处理】
+   - 否则：使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
+   - 筛选含 `"Generated with Kimi Code CLI"` 和 `"<!-- kimi-cr-meta"` 的评论
+   - 提取最新一轮的 JSON metadata
+   - 对比 `previous_head_sha` 与当前 `headRefOid`
+   - 无新 commit → 输出状态报告并结束
+   - 有新 commit → 标记 `Round = N + 1`，进入【增量审查流程】
+   - 无 previous review → `Round = 1`，继续下一步
+
+2. **提取 PR 编号**
    - 从用户输入中提取 PR 号（支持 `#123`、直接数字、或 `owner/repo#123` 格式）
    - 如果没有提供，使用 `Shell` 执行 `gh pr view --json number` 获取当前分支关联的 PR
    - 如果当前分支无关联 PR，提示用户提供 PR 编号
 
-2. **Step 1: PR 资格审查**
+3. **Step 1: PR 资格审查**
    - 使用 `Shell` 执行 `gh pr view <PR>` 获取 PR 状态
    - 使用 `Shell` 执行 `gh pr view <PR> --comments` 获取评论列表
    - 检查是否 closed、draft、trivial、automated、已有 bot 评论
    - 如不符合，返回说明原因并停止
 
-3. **Step 2: 收集项目规范**
+4. **Step 2: 收集项目规范**
    - 使用 `Shell` 执行 `gh pr diff <PR> --name-only` 获取修改文件列表
    - 使用 `ReadFile` 读取根目录和变更文件所在目录的 `CLAUDE.md` 和 `AGENTS.md`
    - 汇总规范文件内容
 
-4. **Step 3: 获取 PR 摘要**
+5. **Step 3: 获取 PR 摘要**
    - 使用 `Shell` 执行 `gh pr view <PR>` 获取标题和描述
    - 使用 `Shell` 执行 `gh pr diff <PR>` 获取 diff
    - 使用 `Agent` 启动 summarizer subagent 总结变更
 
-5. **Step 4: 5 个并行审查 Agent**
+6. **Step 4: 5 个并行审查 Agent**
    使用 `Agent` 并行启动以下 subagent：
    - claude-compliance-checker（检查 CLAUDE.md 合规性）
    - claude-compliance-checker（第二个独立 checker）
@@ -444,27 +502,27 @@ reason 字段应为 "logic" 或 "security"。
    - bug-scanner（扫描明显 Bug）
    - logic-analyzer（分析逻辑和安全性）
 
-6. **Step 5: Issue 验证**
+7. **Step 5: Issue 验证**
    - 收集所有 Agent 发现的问题
    - 为每个 issue 使用 `Agent` 并行启动 issue-validator 验证
    - 收集每个验证结果
 
-7. **Step 6: 过滤与汇总**
+8. **Step 6: 过滤与汇总**
    - 过滤掉 `valid: false` 的 issue
    - 按 file、lines、reason 去重
    - 按优先级排序：CLAUDE.md → AGENTS.md → bug → logic
 
-8. **Step 7: 最终资格审查**
+9. **Step 7: 最终资格审查**
    - 使用 `Shell` 执行 `gh pr view <PR> --json state` 检查 PR 是否仍然开放
    - 如已关闭或合并，停止并提示用户
 
-9. **Step 8: 终端输出**
+10. **Step 8: 终端输出**
    - 使用 `Shell` 执行 `git rev-parse HEAD` 获取完整 SHA
    - 使用 `Shell` 执行 `gh pr view <PR> --json headRepositoryOwner,headRepository` 获取仓库信息
    - 格式化 Markdown 报告
    - 输出到终端
 
-10. **Step 9: 发布 PR 评论**
+11. **Step 9: 发布 PR 评论**
     - 使用 `Shell` 执行 `gh pr review <PR> --comment -b "<review_body>"`
     - `<review_body>` 与终端输出完全一致
     - 向用户确认完成
