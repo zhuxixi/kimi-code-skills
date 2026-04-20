@@ -317,19 +317,101 @@ No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
 - 例如 `@@ -45,7 +67,9 @@` 表示旧文件从第 45 行开始，新文件从第 67 行开始
 - 计算目标代码在新文件中的实际行号
 
-### Step 9: 发布 PR 评论（必须）
+### Step 9: 构建并发布 PR Review 评论（必须）
 
-使用 `Shell` 执行以下命令发布 PR 评论：
+此步骤构建包含 metadata 的结构化 review 评论，并发布到 PR。
 
-```bash
-gh pr review <PR> --comment -b "<review_body>"
+#### 9.1 构建评论 Body
+
+评论由两部分组成：
+
+**Part A: HTML Comment Metadata（机器可读，GitHub 渲染时隐藏）**
+
+在评论 body 最开头插入：
+```markdown
+<!-- kimi-cr-meta
+{"round":{round},"pr_number":{pr_number},"head_sha":"{head_sha}","previous_head_sha":"{previous_head_sha}","total_issues":{total},"resolved_count":{resolved},"new_count":{new},"issues":[{issues_json}],"timestamp":"{iso_timestamp}"}
+-->
 ```
 
-`<review_body>` 必须与终端输出的 Markdown 报告完全一致。
+Metadata 字段：
+- `round`: 当前轮次（首次审查为 1，增量审查为 N+1）
+- `pr_number`: PR 编号
+- `head_sha`: 当前 PR head commit 的完整 SHA（40 字符）
+- `previous_head_sha`: 上一轮 review 时的 head SHA（Round-1 为 null）
+- `total_issues`: 当前轮次统计的问题总数
+- `resolved_count`: 本轮标记为 resolved 的问题数（Round-1 为 0）
+- `new_count`: 本轮新发现的问题数
+- `issues`: 问题数组，每个元素含 `status`（"open" 或 "resolved"）
+- `timestamp`: ISO 8601 格式时间戳
 
-此步骤必须执行。只要有资格审查通过，无论是否发现问题，都必须发布评论。发现问题时发布问题列表；未发现问题时发布 "No issues found" 消息。
+**Part B: Markdown 人类可读部分**
 
-如果 `gh pr review` 命令失败，向用户报告错误详情，不重复尝试（避免产生重复评论）。
+Round-1 格式：
+```markdown
+### Code Review | Round-1
+
+Found {N} issues:
+
+1. {description} ({reason})
+
+   https://github.com/owner/repo/blob/{sha}/{file}#L{start}-L{end}
+
+🤖 Generated with Kimi Code CLI
+```
+
+Round-N（N ≥ 2，增量审查）格式：
+```markdown
+### Code Review | Round-{N} (Re-check)
+
+Previous Round-{N-1} issues: {M}
+- **Resolved**: {R} ({resolved_issue_descriptions})
+- **Still open**: {M-R}
+
+New issues found: {new_count}
+
+#### Still Open from Previous Rounds
+
+{remaining_issue_list}
+
+#### New Issues
+
+{new_issue_list}
+
+🤖 Generated with Kimi Code CLI
+```
+
+All issues resolved 格式：
+```markdown
+### Code Review | Round-{N} (Re-check)
+
+Previous Round-{N-1} issues: {M}
+- **Resolved**: {M}
+- **Still open**: 0
+
+New issues found: 0
+
+✅ **All issues resolved!**
+
+🤖 Generated with Kimi Code CLI
+```
+
+#### 9.2 发布 Review 评论
+
+使用 `Shell` 执行：
+```bash
+# 将 review body 写入临时文件（避免 shell 转义和长命令问题）
+echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
+gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
+```
+
+注意：
+- 每轮审查都发布**新评论**，不编辑旧评论
+- `<review_body>` 必须包含 HTML Comment metadata + Markdown 人类可读部分
+- 必须包含 `"🤖 Generated with Kimi Code CLI"` 标识，用于后续识别
+- 必须包含 `"### Code Review | Round-{N}"` 标题
+- 此步骤必须执行。只要有资格审查通过，无论是否发现问题，都必须发布评论
+- 如果 `gh pr review` 命令失败，向用户报告错误详情，不重复尝试
 
 ## HIGH SIGNAL 原则
 
@@ -522,9 +604,9 @@ reason 字段应为 "logic" 或 "security"。
    - 格式化 Markdown 报告
    - 输出到终端
 
-11. **Step 9: 发布 PR 评论**
-    - 使用 `Shell` 执行 `gh pr review <PR> --comment -b "<review_body>"`
-    - `<review_body>` 与终端输出完全一致
+11. **Step 9: 构建并发布 PR Review 评论**
+    - 构建包含 HTML Comment metadata 的结构化评论 body
+    - 使用 `Shell` 执行 `gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md`
     - 向用户确认完成
 
 ## gh 命令参考
@@ -554,15 +636,20 @@ gh pr diff <PR>
 gh pr view <PR> --json headRepositoryOwner,headRepository
 
 # 发布 PR 评论
-gh pr review <PR> --comment -b "<review_body>"
+echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
+gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 ```
 
 ## 示例输出
 
-### 发现问题时的输出
+### Round-1 发现问题时的输出
 
 ```markdown
-### Code Review
+<!-- kimi-cr-meta
+{"round":1,"pr_number":123,"head_sha":"abc123def4567890123456789012345678901234","previous_head_sha":null,"total_issues":3,"resolved_count":0,"new_count":3,"issues":[{"id":"issue-1","description":"Missing error handling for OAuth callback","reason":"bug","file":"src/auth.ts","lines":"67-72","status":"open","first_round":1},{"id":"issue-2","description":"Inconsistent naming pattern","reason":"AGENTS.md","file":"src/utils.ts","lines":"23-28","status":"open","first_round":1},{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1}],"timestamp":"2026-04-21T10:00:00Z"}
+-->
+
+### Code Review | Round-1
 
 Found 3 issues:
 
@@ -581,12 +668,60 @@ https://github.com/owner/repo/blob/abc123def4567890123456789012345678901234/src/
 🤖 Generated with Kimi Code CLI
 ```
 
-### 无问题时的输出
+### 无问题时的输出（Round-1）
 
 ```markdown
-### Code Review
+<!-- kimi-cr-meta
+{"round":1,"pr_number":123,"head_sha":"abc123def4567890123456789012345678901234","previous_head_sha":null,"total_issues":0,"resolved_count":0,"new_count":0,"issues":[],"timestamp":"2026-04-21T10:00:00Z"}
+-->
+
+### Code Review | Round-1
 
 No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
+
+🤖 Generated with Kimi Code CLI
+```
+
+### Round-2 增量审查输出（部分问题已修复）
+
+```markdown
+<!-- kimi-cr-meta
+{"round":2,"pr_number":123,"head_sha":"fed789abc0123456789012345678901234567890","previous_head_sha":"abc123def4567890123456789012345678901234","total_issues":1,"resolved_count":2,"new_count":0,"issues":[{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1}],"timestamp":"2026-04-21T10:30:00Z"}
+-->
+
+### Code Review | Round-2 (Re-check)
+
+Previous Round-1 issues: 3
+- **Resolved**: 2 (Missing error handling, Inconsistent naming)
+- **Still open**: 1
+
+New issues found: 0
+
+#### Still Open from Round-1
+
+3. Memory leak: OAuth state not cleaned up (bug: missing cleanup in finally block)
+
+https://github.com/owner/repo/blob/fed789abc0123456789012345678901234567890/src/auth.ts#L88-L95
+
+🤖 Generated with Kimi Code CLI
+```
+
+### Round-3 全部修复输出
+
+```markdown
+<!-- kimi-cr-meta
+{"round":3,"pr_number":123,"head_sha":"aaa111bbb222333444555666777888999000aaaa","previous_head_sha":"fed789abc0123456789012345678901234567890","total_issues":0,"resolved_count":1,"new_count":0,"issues":[],"timestamp":"2026-04-21T11:00:00Z"}
+-->
+
+### Code Review | Round-3 (Re-check)
+
+Previous Round-2 issues: 1
+- **Resolved**: 1 (Memory leak)
+- **Still open**: 0
+
+New issues found: 0
+
+✅ **All issues resolved!**
 
 🤖 Generated with Kimi Code CLI
 ```
