@@ -14,8 +14,6 @@ Kimi CLI skills collection focused on code review and development workflows.
 | [summary-and-commit](./summary-and-commit) | 总结并提交会话内容 | `sam`, `summary and commit`, `总结并提交` |
 | [todo](./todo) | GitHub Issues 看板管理 | `记录todo`, `添加待办`, `看板状态` |
 | [markdown-pro](./markdown-pro) | 专业 Markdown 文档生成 | `生成文档`, `创建 changelog`, `生成 README` |
-| [project-doc-generator](./project-doc-generator) | 渐进式项目文档生成 | `生成文档`, `渐进式文档` |
-| [safe-process-management](./safe-process-management) | Windows 安全进程管理 | `taskkill`, `查看进程` |
 
 ## 安装
 
