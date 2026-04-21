@@ -306,7 +306,7 @@ No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
 ```
 
 代码链接格式要求：
-- 使用 `Shell` 执行 `git rev-parse HEAD` 获取完整 SHA（40 字符）
+- 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取 PR head SHA（40 字符）
 - 链接格式必须严格为：`https://github.com/owner/repo/blob/[sha]/path#L[start]-L[end]`
 - 行范围至少包含 1 行上下文（评论目标行的前后至少各 1 行）
 - 从 `gh pr diff` 中提取准确的行号信息
@@ -485,7 +485,7 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 | 审查过程中 PR 关闭 | Step 7 捕获，不发布评论 |
 | `gh` 命令失败 | 向用户报告错误详情，停止执行 |
 | 当前分支无关联 PR | 提示用户提供 PR 编号 |
-| 提取不到完整 SHA | 使用 `git rev-parse HEAD` 重试，失败则报错 |
+| 提取不到完整 SHA | 使用 `gh pr view <PR> --json headRefOid` 获取 head SHA，失败则报错 |
 | Agent 返回格式错误的 JSON | 尝试解析，失败则忽略该 Agent 的输出 |
 | diff 过大无法完整处理 | 仅分析前 500 行变更，其余部分标记为 "部分分析" |
 | 用户手动触发但无新 commit | Step 0 检测 → 输出 "No new commits since Round-{N}"，不启动 watcher |
@@ -723,7 +723,7 @@ reason 字段应为 "logic" 或 "security"。
    - 如已关闭或合并，停止并提示用户
 
 10. **Step 8: 终端输出**
-   - 使用 `Shell` 执行 `git rev-parse HEAD` 获取完整 SHA
+   - 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取完整 SHA
    - 使用 `Shell` 执行 `gh pr view <PR> --json headRepositoryOwner,headRepository` 获取仓库信息
    - 格式化 Markdown 报告
    - 输出到终端
@@ -1083,7 +1083,7 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 **原因**：SHA 不完整、格式不正确、或行号计算错误。
 
 **解决**：
-- 确保使用 `git rev-parse HEAD` 获取完整 40 字符 SHA
+- 确保使用 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取完整 40 字符 SHA
 - 确保格式严格为 `https://github.com/owner/repo/blob/[sha]/path#L[start]-L[end]`
 
 ## 常见误报类型
