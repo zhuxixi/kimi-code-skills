@@ -653,6 +653,170 @@ reason 字段应为 "logic" 或 "security"。
     - 输出 watcher 启动信息
     - 不满足条件 → 不启动 watcher，正常结束
 
+## Re-entry 处理
+
+当 `--print` 模式因 background watcher 完成而 re-enter 时，主 agent 会收到一个 `<system-reminder>` 形式的通知。本章节定义该场景的处理流程。
+
+### 触发条件
+
+用户输入包含：
+- `<system-reminder>` 标签
+- `"Background task completed"`
+- `"PR change watcher"`
+
+满足以上条件时，跳过 Step 0-9 的正常流程，直接执行本章节定义的逻辑。
+
+### Re-entry 执行流程
+
+**Step R1: 解析 watcher 结果**
+
+从 `<system-reminder>` 中提取 watcher 的 output 文本，解析状态：
+- `"New commits detected"` → 进入增量审查
+- `"All reviewers approved"` → 输出 approval 状态，不启动新 watcher
+- `"PR state changed to CLOSED/MERGED"` → 输出 PR 状态变更，不启动新 watcher
+- `"Timeout"` → 输出等待超时，不启动新 watcher
+
+**Step R2: 获取当前状态（仅 "New commits detected" 分支）**
+
+1. 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid,state` 确认当前 PR 状态
+2. 如果 `state` 为 `CLOSED` 或 `MERGED` → 输出 "PR already closed/merged" → 不启动 watcher → 结束
+3. 使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
+4. 筛选 Kimi CR 评论，提取最新一轮 metadata（同 Step 0.2）
+5. 获取 `previous_issues` 列表和 `previous_head_sha`
+
+**Step R3: 获取完整 diff**
+
+使用 `Shell` 执行 `gh pr diff <PR>` 获取完整 diff。
+
+**Step R4: 执行增量审查**
+
+启动 delta-reviewer Agent（前台，非 background）：
+- 输入：完整 diff + previous_issues + 相关规范文件
+- 等待 delta-reviewer 完成
+- 收集结果：resolved_issues / new_issues / unresolved_issues
+
+**Step R5: 构建并发布 Round-N review 评论**
+
+同 Step 9，但：
+- `round = previous_round + 1`
+- `previous_head_sha = previous_head_sha`
+- `head_sha = 当前 headRefOid`
+- `resolved_count = len(resolved_issues)`
+- `new_count = len(new_issues)`
+- issues 列表中已修复的标记 `status="resolved"`，未修复的标记 `status="open"`，新问题标记 `status="open"`
+
+**Step R6: 决定是否继续监控**
+
+- 如果 `unresolved_issues` 非空 或 `new_issues` 非空 → 启动新的 Background Watcher（同 Step 10）
+- 如果全部为空 → 输出 "All issues resolved ✓"，不启动 watcher，结束
+
+### 非 "New commits detected" 分支的处理
+
+**"All reviewers approved"**：
+- 输出：`"All reviewers have approved this PR. No further action needed."`
+- 不启动 watcher
+
+**"PR closed/merged"**：
+- 输出：`"PR has been {state}. Stopping monitoring."`
+- 不启动 watcher
+
+**"Timeout"**：
+- 输出：`"No new commits detected within timeout. Previous issues may still be open:"`
+- 列出之前仍 open 的 issues
+- 不启动 watcher
+
+## 增量审查流程
+
+当检测到 PR 有新的 commit（相对于上一轮 review）时，执行增量审查而非完整审查。本流程替代完整流程中的 Step 3-5。
+
+### 适用场景
+
+- Step 0 检测到 previous review metadata 且当前 head SHA != previous_head_sha
+- Re-entry 处理中 watcher 检测到新 commit
+
+### 输入
+
+- `previous_issues`: 从上一轮 metadata 提取的问题列表（含 `id`, `description`, `reason`, `file`, `lines`, `status`, `first_round`）
+- `previous_head_sha`: 上一轮 review 时的 head SHA
+- `current_head_sha`: 当前 PR head SHA
+- PR 完整 diff（`gh pr diff` 输出）
+- 相关规范文件（CLAUDE.md / AGENTS.md）
+
+### 执行步骤
+
+**Step Δ1: 获取完整 diff**
+
+使用 `Shell` 执行 `gh pr diff <PR>` 获取完整 diff。
+
+**Step Δ2: 启动 delta-reviewer Agent**
+
+使用 `Agent` 启动 delta-reviewer（前台，1 个 Agent）：
+
+输入：
+- PR 完整 diff
+- `previous_issues` 列表
+- `previous_head_sha`
+- `current_head_sha`
+- 相关规范文件内容
+
+**Step Δ3: 收集 delta-reviewer 结果**
+
+delta-reviewer 输出 JSON：
+```json
+{
+  "resolved_issues": [
+    {
+      "original_id": "issue-1",
+      "description": "...",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "67-72",
+      "resolution_note": "Error handling added in new commit"
+    }
+  ],
+  "new_issues": [
+    {
+      "id": "issue-4",
+      "description": "...",
+      "reason": "logic",
+      "file": "src/auth.ts",
+      "lines": "100-105",
+      "suggestion": "..."
+    }
+  ],
+  "unresolved_issues": [
+    {
+      "original_id": "issue-3",
+      "description": "...",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "88-95"
+    }
+  ],
+  "pass": false
+}
+```
+
+**Step Δ4: 汇总问题列表**
+
+构建当前轮次的完整 issues 列表：
+- `resolved_issues` → 保留原 `id`，标记 `status="resolved"`
+- `unresolved_issues` → 保留原 `id`，标记 `status="open"`
+- `new_issues` → 生成新 `id`（如 `"issue-{max_id+1}"`），标记 `status="open"`，`first_round = current_round`
+
+**Step Δ5: 继续至 Step 6（过滤与汇总）**
+
+将汇总后的问题列表传入 Step 6，继续执行 Step 6-9-10 的标准流程。
+
+### 与完整流程的区别
+
+| 步骤 | 完整流程 | 增量流程 |
+|------|---------|---------|
+| Step 3 | summarizer + 5 个审查 Agent | delta-reviewer 1 个 Agent |
+| Step 4 | 5 个并行审查 Agent | 由 delta-reviewer 替代 |
+| Step 5 | 每个 issue 单独验证 | 由 delta-reviewer 内部完成对比验证 |
+| 输出 | 全新问题列表 | resolved + new + unresolved 分类 |
+
 ## gh 命令参考
 
 本 Skill 使用以下 `gh` 命令：
