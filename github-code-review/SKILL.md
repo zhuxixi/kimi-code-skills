@@ -488,6 +488,14 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 | 提取不到完整 SHA | 使用 `git rev-parse HEAD` 重试，失败则报错 |
 | Agent 返回格式错误的 JSON | 尝试解析，失败则忽略该 Agent 的输出 |
 | diff 过大无法完整处理 | 仅分析前 500 行变更，其余部分标记为 "部分分析" |
+| 用户手动触发但无新 commit | Step 0 检测 → 输出 "No new commits since Round-{N}"，不启动 watcher |
+| Metadata 提取失败 | Fallback 到完整流程，输出 "Previous review metadata corrupted" |
+| Watcher 超时（无新 commit） | Watcher 输出 "Timeout"，主 agent 输出等待超时提醒 |
+| Watcher 检测到 reviewer approved | Watcher 输出 "All reviewers approved"，主 agent 结束监控 |
+| Watcher 检测到 PR closed/merged | Watcher 输出 "PR state changed"，主 agent 结束监控 |
+| Round 编号溢出（>99） | 继续递增，无上限 |
+| re-entry 时 PR 已关闭 | Re-entry Step R2 捕获，不执行增量审查 |
+| re-entry 时 delta-reviewer 失败 | 输出错误信息，不启动新 watcher |
 
 ## SubAgent 详细定义
 
@@ -576,6 +584,85 @@ reason 字段应为 "logic" 或 "security"。
 4. 对于 bug 类 issue：检查代码逻辑是否确实错误，是否是 PR 引入的
 5. 如果是误报，说明原因
 6. 返回验证结果和解释
+
+### pr-watcher
+
+**输入**: PR 编号、仓库 owner/repo、监控开始时的 head SHA (`base_sha`)、轮询间隔、最大等待时间
+**输出**: 状态文本（"New commits detected" / "All reviewers approved" / "PR closed" / "Timeout"）
+
+**任务**:
+1. 记录 `start_time`
+2. 循环执行（最多 `max_iterations = max_wait_s / poll_interval_s` 次）：
+   a. `Shell: sleep {poll_interval_s}`
+   b. `Shell: gh pr view {PR} --json headRefOid,state,reviewDecision`
+   c. 如果 `state` 为 `CLOSED` 或 `MERGED` → 输出 `"PR state changed to {state}"` → 结束
+   d. 如果 `reviewDecision` 为 `APPROVED` → 输出 `"All reviewers approved"` → 结束
+   e. 如果当前 `headRefOid` != `base_sha` → 输出 `"New commits detected. Previous SHA: {base_sha}, Current SHA: {current_sha}"` → 结束
+   f. 检查是否超过 `max_wait_time`
+3. 超时 → 输出 `"Timeout: no new commits after {max_wait_s}s"`
+
+**约束**:
+- 只使用 `Shell` 工具执行 `gh` 命令
+- 不读取代码文件
+- 不做代码分析
+- 每次循环输出当前状态（如 `"Round X: SHA unchanged, state=OPEN, decision=PENDING"`）
+
+### delta-reviewer
+
+**输入**: PR 完整 diff、previous_issues 列表、previous_head_sha、current_head_sha、相关规范文件
+**输出**: JSON `{resolved_issues, new_issues, unresolved_issues, pass}`
+
+**任务**:
+1. 对比 `previous_issues` 和当前 diff：
+   - 遍历每个 previous issue，检查其 `file` + `lines` 范围是否在 diff 中被修改
+   - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 `resolved_issues`
+   - 未修改 → 加入 `unresolved_issues`
+2. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 `new_issues`
+   - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
+   - 仔细审查修复代码本身的正确性
+3. 对于规范类问题，检查 CLAUDE.md / AGENTS.md 中相关规则是否仍适用
+
+**输出 JSON 格式**:
+```json
+{
+  "resolved_issues": [
+    {
+      "original_id": "issue-1",
+      "description": "Missing error handling for OAuth callback",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "67-72",
+      "resolution_note": "Error handling added in new commit"
+    }
+  ],
+  "new_issues": [
+    {
+      "id": "issue-4",
+      "description": "New race condition in callback",
+      "reason": "logic",
+      "file": "src/auth.ts",
+      "lines": "100-105",
+      "suggestion": "Add mutex lock"
+    }
+  ],
+  "unresolved_issues": [
+    {
+      "original_id": "issue-3",
+      "description": "Memory leak: OAuth state not cleaned up",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "88-95"
+    }
+  ],
+  "pass": false
+}
+```
+
+**约束**:
+- 只关注被修改的代码，不评论原有代码
+- 对于已修复的问题，必须简要说明修复方式（`resolution_note`）
+- 对于未修复的问题，保持原描述不变
+- 新问题使用新的 `id`，不影响原有 issue 编号
 
 ## 内部执行模板
 
@@ -846,6 +933,18 @@ gh pr view <PR> --json headRepositoryOwner,headRepository
 # 发布 PR 评论
 echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
 gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
+
+# 获取 PR review 评论列表（含 review body 和提交时间）
+gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+
+# 获取 PR head commit SHA（用于对比是否有新 commit）
+gh pr view <PR> --json headRefOid --jq '.headRefOid'
+
+# 获取 PR reviewDecision（APPROVED / CHANGES_REQUESTED / PENDING）
+gh pr view <PR> --json reviewDecision
+
+# 获取 PR commits 列表
+gh api repos/{owner}/{repo}/pulls/{number}/commits
 ```
 
 ## 示例输出
@@ -1145,6 +1244,72 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 3. 对于规范类 issue：确认规则是否在规范文件中被明确表述且适用
 4. 对于 bug 类 issue：确认代码逻辑是否确实错误且由 PR 引入
 5. 输出 JSON：{"valid": boolean, "explanation": "string"}
+```
+
+### pr-watcher prompt 模板
+
+```
+你是一个 PR 变更监控器。你的唯一任务是检测 GitHub PR 是否有新的 commit 或状态变化。
+
+输入参数：
+- PR 编号: {pr_number}
+- 仓库 owner/repo: {owner}/{repo}
+- 监控开始时的 head SHA: {base_sha}
+- 轮询间隔: {poll_interval_s} 秒（默认 300）
+- 最大等待时间: {max_wait_s} 秒（默认 3600）
+
+执行流程：
+
+1. 记录 start_time = 当前时间
+2. 循环执行（最多 {max_iterations} 次）：
+   a. `Shell: sleep {poll_interval_s}`
+   b. `Shell: gh pr view {pr_number} --json headRefOid,state,reviewDecision`
+      → 解析 JSON，获取当前 head SHA、state、reviewDecision
+
+   c. 如果 state == "CLOSED" 或 "MERGED"：
+      → 输出 "PR state changed to {state}"
+      → 结束
+
+   d. 如果 reviewDecision == "APPROVED"：
+      → 输出 "All reviewers approved"
+      → 结束
+
+   e. 如果当前 head SHA != {base_sha}：
+      → 输出 "New commits detected. Previous SHA: {base_sha}, Current SHA: {current_sha}"
+      → 结束
+
+   f. 检查是否超过 max_wait_time
+3. 超时：输出 "Timeout: no new commits after {max_wait_s}s"
+
+约束：
+- 只使用 Shell 工具执行 gh 命令
+- 不读取代码文件
+- 不做代码分析
+- 每次循环必须输出当前状态（如 "Round X: SHA unchanged, state=OPEN, decision=PENDING"）
+```
+
+### delta-reviewer prompt 模板
+
+```
+你是一个增量代码审查员。你的任务是对比上一轮发现的问题和当前 PR 的最新 diff，判断哪些问题已被修复，并发现新问题。
+
+输入：
+- PR 完整 diff：{diff}
+- 上一轮问题列表：{previous_issues}
+- 上一轮 head SHA：{previous_head_sha}
+- 当前 head SHA：{current_head_sha}
+- 相关规范文件：{guidelines}
+
+要求：
+1. 遍历每个 previous issue，检查其 file + lines 范围是否在 diff 中被修改：
+   - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 resolved_issues，附 resolution_note
+   - 未修改 → 加入 unresolved_issues
+2. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 new_issues
+   - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
+   - 仔细审查修复代码本身的正确性
+3. 忽略已确认 resolved 的旧问题
+4. 对于规范类问题，确认规则是否仍适用于当前变更
+5. 输出 JSON：{"resolved_issues": [...], "new_issues": [...], "unresolved_issues": [...], "pass": boolean}
 ```
 
 ## 审查结果示例解析
