@@ -1,173 +1,209 @@
 ---
 name: issue-implementor
-description: 实现 GitHub Issue 的完整工作流 - 从分支管理到代码实现，智能分析 issue 内容并执行开发任务
+description: |
+  Implement GitHub Issues end-to-end using subagent-driven development. Automates branch management,
+  issue analysis, solution design, task planning, implementation, and verification.
+  Use when user mentions: "实现 issue", "开发 issue", "fix issue", "implement issue",
+  or any message containing an issue reference like "#123", "issue #42", "#27".
+  Also triggers on requests to implement, fix, or develop a specific GitHub issue number.
 ---
 
-# Issue Implementor Skill
+# Issue Implementor
 
-根据 GitHub Issue 自动完成从分支创建到代码实现的完整开发流程。
+Implement GitHub Issues from branch creation to code completion using specialized subagents
+for analysis, design, planning, execution, and verification.
 
-## 使用方式
+## Usage
 
-用户提供 issue 号（如 `#27`），Skill 自动执行以下流程：
+Trigger with any of these patterns:
 
 ```
-用户: #27
-或
-用户: 帮我实现 issue #27
+实现 issue #27
+开发 issue 42
+fix issue #123
+implement issue 456
+#27
 ```
 
-## 执行流程
+Extract issue numbers from:
+- `#123` format
+- Plain digits like `456`
+- Prompt user if no number provided
 
-### Phase 1: 分支管理
+## Prerequisites
 
-1. **检查本地分支**
-   - 检查是否存在与 issue 相关的本地分支（如 `issue-27`、`fix-27`、`feature-27` 等）
-   - 如果存在，切换到该分支
-   - 如果不存在，基于最新 master/main 创建新分支 `issue-{number}`
-
-2. **分支命名规范**
+1. **GitHub CLI (gh)** installed and authenticated:
+   ```bash
+   gh --version
+   gh auth status
    ```
-   issue-{number}          # 默认命名
-   feature/issue-{number}   # 功能开发（可选）
-   fix/issue-{number}       # Bug 修复（可选）
+   Run `gh auth login` if not authenticated. Need read access to issues and push access to the repo.
+
+2. Current directory in a Git repo with a GitHub remote. Verify with `git remote -v`.
+
+3. Permission to read issues and push branches.
+
+## Execution Flow
+
+### Phase 1: Branch Management
+
+1. Extract issue number from user input
+2. Fetch issue basics:
+   ```bash
+   gh issue view <number> --json number,title,state,labels,body
+   ```
+   - Issue does not exist → stop, prompt user to check number
+   - Issue is closed → ask whether to reopen or continue
+3. Check local branches:
+   ```bash
+   git branch --list '*{number}*'
+   ```
+   - Branch exists with uncommitted changes → ask: continue, stash, or create new branch
+   - Branch exists clean → switch to it
+   - No branch → checkout main/master, pull, create `issue-{number}`
+4. Branch naming:
+   ```
+   issue-{number}           # default
+   feature/issue-{number}   # complex feature
+   fix/issue-{number}       # bug fix
    ```
 
-### Phase 2: Issue 分析
+### Phase 2: Issue Analysis
 
-1. **获取 Issue 详情**
-   - 使用 GitHub MCP 工具读取 issue 标题、描述、标签、评论
-   - 提取实现方案（如果有）
+Launch two parallel `Agent` instances:
 
-2. **判断是否有实现方案**
+1. **issue-analyzer** — analyze issue content
+   - Input: issue title, body, labels, comments
+   - Output: `{has_plan, plan_summary, requirements, issue_type, complexity, affected_areas, uncertainties}`
+   - See [references/subagents.md](references/subagents.md#issue-analyzer) for full definition
 
-   **情况 A: Issue 包含实现方案**
-   - 直接按照方案执行
-   - 如需澄清，向用户确认
+2. **repo-scanner** — scan codebase structure
+   - Input: issue title, body preview, project root listing
+   - Output: `{tech_stack, relevant_files, project_patterns, test_setup}`
+   - See [references/subagents.md](references/subagents.md#repo-scanner) for full definition
 
-   **情况 B: Issue 无实现方案**
-   - 扫描当前代码仓库结构
-   - 识别相关模块/文件
-   - 设计实现方案
-   - 向用户展示方案并确认
+After collecting both outputs:
+- `uncertainties` non-empty → present to user, wait for clarification, then re-run issue-analyzer
+- `has_plan = true` → skip Phase 3, go to Phase 4
+- `has_plan = false` → go to Phase 3
 
-### Phase 3: 代码实现
+### Phase 3: Solution Design
 
-根据方案逐步执行：
-1. 创建/修改文件
-2. 编写代码
-3. 运行测试验证
-4. 如有错误，修复后重新验证
+Only when issue has no built-in plan.
 
-### Phase 4: 完成
+1. Launch **solution-designer**
+   - Input: issue-analyzer output + repo-scanner output + contents of relevant files
+   - Output: `{approach_summary, files_to_create, files_to_modify, files_to_read, estimated_effort, risks, testing_strategy}`
+   - See [references/subagents.md](references/subagents.md#solution-designer) for full definition
 
-1. 展示修改摘要
-2. 建议用户进行 code review
-3. 如需，协助创建 PR
+2. Present plan to user in Markdown:
+   ```markdown
+   ## Solution Design
 
-## 工具依赖
+   **Approach**: {approach_summary}
 
-本 Skill 依赖以下 MCP 工具：
-- `github` - 获取 issue 信息、创建分支、创建 PR
-- `filesystem` - 文件读写操作
-- `shell` - 执行 git 命令、运行测试
+   **New files**: {files_to_create}
+   **Modified files**: {files_to_modify}
+   **Risks**: {risks}
+   **Testing**: {testing_strategy}
 
-## 工作流程示例
+   Proceed with this plan?
+   ```
 
-### 示例 1: Issue 有明确方案
+3. Wait for user confirmation:
+   - Confirmed → go to Phase 4
+   - Requested changes → adjust and re-present
+   - Cancelled → stop, preserve branch state
 
-```
-用户: #27
+### Phase 4: Implementation
 
-AI:
-1. 创建并切换到分支 issue-27
-2. 读取 issue #27: "Add user authentication middleware"
-3. Issue 中已有方案：在 middleware/auth.py 实现 JWT 验证
-4. 按照方案实现代码
-5. 运行测试验证
-6. 完成，展示修改
-```
+1. Launch **task-planner**
+   - Input: solution info (from issue plan or designed solution) + repo-scanner context
+   - Output: ordered task list `{tasks: [{id, description, files, action, test_command, estimated_time}]}`
+   - See [references/subagents.md](references/subagents.md#task-planner) for full definition
 
-### 示例 2: Issue 无具体方案
+2. Execute tasks sequentially with **impl-executor**
+   - One `Agent` per task
+   - Input: single task + project context + current file contents
+   - Output: `{status, summary, files_changed}`
+   - See [references/subagents.md](references/subagents.md#impl-executor) for full definition
 
-```
-用户: #42
+3. Per-task verification:
+   - Run the task's `test_command`
+   - Failed → feed error back to impl-executor for fix (max 2 retries)
+   - Still failed → present to user, ask whether to continue or abort
 
-AI:
-1. 创建并切换到分支 issue-42
-2. 读取 issue #42: "Improve search performance"
-3. Issue 无具体实现方案
-4. 扫描代码仓库，识别 search 相关模块
-5. 设计方案：添加 Redis 缓存层
-6. 向用户展示方案，获得确认
-7. 按照确认的方案实现
-8. 完成，展示修改
-```
+4. Commit every 1-2 tasks:
+   ```bash
+   git add <files>
+   git commit -m "feat(issue-{number}): task {id} - {description}"
+   ```
 
-## 设计实现方案的步骤
+### Phase 5: Verification & Completion
 
-当 issue 无明确方案时：
+1. Launch **test-verifier**
+   - Input: original requirements + full git diff + test setup info
+   - Output: `{all_requirements_met, tests_pass, test_summary, regressions, issues, recommendations}`
+   - See [references/subagents.md](references/subagents.md#test-verifier) for full definition
 
-1. **理解问题**
-   - 分析 issue 描述，理解需求/bug
-   - 查看相关标签（bug, feature, enhancement 等）
+2. If `all_requirements_met = false` or `tests_pass = false`:
+   - Present issues to user
+   - Ask whether to fix or continue
+   - Fix chosen → return to Phase 4 with correction tasks
 
-2. **代码扫描**
-   - 使用 grep 搜索相关代码
-   - 查看项目结构
-   - 识别受影响的模块
+3. Launch **change-summarizer**
+   - Input: full diff + task list + test-verifier result
+   - Output: Markdown summary
+   - See [references/subagents.md](references/subagents.md#change-summarizer) for full definition
 
-3. **设计方案**
-   - 确定修改范围
-   - 规划实现步骤
-   - 预估工作量
+4. Present summary to user, then ask:
+   - Push branch?
+     ```bash
+     git push -u origin issue-{number}
+     ```
+   - Create PR?
+     ```bash
+     gh pr create --title "Fix #${number}: {issue_title}" --body "{summary}"
+     ```
 
-4. **用户确认**
-   - 向用户展示方案
-   - 根据反馈调整
-   - 获得确认后再执行
+## Internal Execution Template
 
-## 安全约束
+When triggered, execute in this exact order:
 
-1. **绝不直接修改 master/main**
-   - 总是在功能分支上工作
-   - 创建 PR 进行代码合并
+1. **Extract issue number** from user input (or prompt)
+2. **Phase 1**: Run branch management steps
+3. **Phase 2**: Launch issue-analyzer + repo-scanner in parallel
+   - Handle uncertainties if any
+   - Route to Phase 3 or 4 based on `has_plan`
+4. **Phase 3** (if needed): Launch solution-designer, present to user, wait for confirmation
+5. **Phase 4**: Launch task-planner, then loop through tasks with impl-executor
+   - Run per-task tests
+   - Commit every 1-2 tasks
+6. **Phase 5**: Launch test-verifier, handle failures, then launch change-summarizer
+7. **Wrap up**: Present summary, offer push and PR creation
 
-2. **测试优先**
-   - 如项目有测试，先运行确保基准通过
-   - 实现后运行测试验证
+## Subagent Reference
 
-3. **渐进式实现**
-   - 复杂任务分解为多个步骤
-   - 每步完成后验证
-   - 避免大规模一次性修改
+All subagent definitions live in [references/subagents.md](references/subagents.md):
+- issue-analyzer
+- repo-scanner
+- solution-designer
+- task-planner
+- impl-executor
+- test-verifier
+- change-summarizer
 
-## 边界情况处理
+Read the relevant subagent definition before dispatching it.
 
-| 情况 | 处理方式 |
-|------|---------|
-| Issue 不存在 | 提示用户检查 issue 号 |
-| Issue 已关闭 | 询问是否重新打开或创建新分支 |
-| 分支已存在且有修改 | 询问是否继续、重置或新建分支 |
-| 方案不明确 | 先设计再执行，等待用户确认 |
-| 需要多文件大幅修改 | 分阶段实现，每阶段验证 |
+## Boundary Cases
 
-## 提示词模板
+See [references/boundary-cases.md](references/boundary-cases.md) for the full table.
 
-当用户使用此 skill 时，遵循以下内部提示词：
+Key scenarios covered: issue not found, issue closed, dirty existing branch, no main/master branch, user rejects plan, executor blocked, test failures after retry, large task counts, issue closed mid-implementation, no test framework, gh/git failures.
 
-```
-用户想要实现 issue #{number}。
+## Workflow Examples
 
-步骤：
-1. 使用 github MCP 获取 issue 详情
-2. 使用 shell 检查本地分支状态
-3. 如需要，创建并切换到 issue-{number} 分支
-4. 分析 issue 内容，判断是否有实现方案
-5. 如无方案，扫描代码仓库，设计实现方案，向用户确认
-6. 按方案逐步实现
-7. 验证实现（测试/检查）
-8. 总结修改
-
-始终遵循：不在 master 直接开发，先确认方案再执行复杂修改。
-```
+See [references/examples.md](references/examples.md) for concrete walkthroughs:
+1. Issue with an existing plan
+2. Issue requiring solution design
+3. Issue with uncertainties needing user clarification

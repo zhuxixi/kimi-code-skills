@@ -10,7 +10,7 @@ Kimi CLI skills collection focused on code review and development workflows.
 |-------|------|--------|
 | [github-code-review](./github-code-review) | GitHub PR 自动化代码审查 | `review pr`, `审查 pr`, `pr review` |
 | [issue-creator](./issue-creator) | 会话 Issue 创建器 | `创建 issue`, `记录到 issue`, `总结成 issue` |
-| [issue-implementor](./issue-implementor) | GitHub Issue 实现工作流 | `实现 issue`, `开发 issue` |
+| [issue-implementor](./issue-implementor) | GitHub Issue 子agent驱动实现工作流 | `实现 issue`, `开发 issue`, `fix issue`, `implement issue`, `#\d+` |
 | [summary-and-commit](./summary-and-commit) | 总结并提交会话内容 | `sam`, `summary and commit`, `总结并提交` |
 | [todo](./todo) | GitHub Issues 看板管理 | `记录todo`, `添加待办`, `看板状态` |
 | [markdown-pro](./markdown-pro) | 专业 Markdown 文档生成 | `生成文档`, `创建 changelog`, `生成 README` |

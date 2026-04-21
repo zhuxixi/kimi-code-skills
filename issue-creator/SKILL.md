@@ -26,7 +26,7 @@ description: |
 1. **分析会话内容** - 提取会话中的关键信息
 2. **识别方案** - 检测是否已形成具体方案
 3. **生成结构化内容** - 按照模板组织 Issue 内容
-4. **创建 GitHub Issue** - 使用 GitHub MCP 工具创建
+4. **创建 GitHub Issue** - 使用 `gh` CLI 创建（无需额外 MCP 配置）
 
 ## 工作流程
 
@@ -143,22 +143,39 @@ description: |
 
 ### Step 5: 创建 Issue
 
-使用 GitHub MCP 创建 Issue：
+使用 `gh` CLI 创建 Issue（无需 MCP，依赖本地已认证的 `gh` 环境）：
 
-```python
-issue_write(
-    method="create",
-    owner="{owner}",
-    repo="{repo}",
-    title="{type}: {标题}",
-    body="{生成的内容}",
-    labels=["{标签1}", "{标签2}"]
-)
+```bash
+# 方式 1：短内容（直接内联）
+gh issue create \
+  --repo "<owner>/<repo>" \
+  --title "<type>: <标题>" \
+  --body "<生成的内容>" \
+  --label "<label1>,<label2>"
+
+# 方式 2：长内容或含特殊字符（推荐 — 写入临时文件避免转义）
+cat > /tmp/kimi-issue.md << 'EOF'
+<生成的 Issue 完整内容>
+EOF
+
+gh issue create \
+  --repo "<owner>/<repo>" \
+  --title "<type>: <标题>" \
+  --body-file /tmp/kimi-issue.md \
+  --label "<label1>,<label2>"
+```
+
+**获取 Issue URL 和编号**：
+```bash
+# gh issue create 会输出创建的 issue URL
+# 示例输出：https://github.com/owner/repo/issues/42
+issue_url=$(gh issue create ...)
+echo "$issue_url"
 ```
 
 **默认标签**：
-- 有方案：`["todo", "enhancement"]` 或 `["todo", "bug"]`
-- 无方案：`["discussion", "help wanted"]` 或 `["research"]`
+- 有方案：`todo,enhancement` 或 `todo,bug`
+- 无方案：`discussion,"help wanted"` 或 `research`
 
 ## 使用示例
 
