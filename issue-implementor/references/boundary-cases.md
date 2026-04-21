@@ -22,3 +22,10 @@ How the issue-implementor skill handles edge scenarios and failures.
 | `git` command fails | Report the exact error to the user and stop execution. |
 | `git push` fails (e.g., no write access) | Report the error. Offer to retry or stop. |
 | `gh pr create` fails | Report the error. Show the command that failed so the user can run it manually. |
+| Worktree directory not ignored | Add directory to `.gitignore`, commit the change, then proceed with worktree creation. |
+| Worktree already exists for issue | `cd` into existing worktree, verify branch state, continue. |
+| Worktree branch has uncommitted changes | Same as dirty branch: ask user whether to continue, stash, or reset. |
+| Worktree creation fails | Report git error. Common causes: branch already exists, path conflicts. |
+| Baseline tests fail in worktree | Report failures to user. Ask whether to proceed or investigate first. |
+| User wants to keep worktree after PR | Do not remove. Leave worktree for further edits. |
+| User wants worktree removed after PR | Run `git worktree remove <path>`. If branch is fully merged, optionally delete branch. |

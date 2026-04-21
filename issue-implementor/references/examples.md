@@ -11,10 +11,14 @@ User: #27
 
 AI:
 1. Extract issue number: 27
-2. Phase 1 — Branch management:
-   - Check local branches: none matching *27*
-   - Checkout main, pull latest
-   - Create and switch to branch issue-27
+2. Phase 1 — Worktree setup:
+   - Check for worktree directory: .worktrees/ exists
+   - Verify ignored: git check-ignore confirms .worktrees/ is ignored
+   - Check existing worktrees: none for issue-27
+   - Create worktree: git worktree add .worktrees/issue-27 -b issue-27
+   - cd .worktrees/issue-27
+   - Run setup: pip install -r requirements.txt
+   - Baseline tests: pytest tests/ → 42 passed, 0 failed
 3. Phase 2 — Parallel analysis:
    - issue-analyzer:
      - has_plan: true
@@ -40,6 +44,7 @@ AI:
 6. Completion:
    - Present summary to user
    - Offer to push branch and create PR
+   - Offer to remove worktree after PR creation
 ```
 
 ---
@@ -51,9 +56,15 @@ User: #42
 
 AI:
 1. Extract issue number: 42
-2. Phase 1 — Branch management:
-   - Branch issue-42 exists and is clean
-   - Switch to issue-42
+2. Phase 1 — Worktree setup:
+   - .worktrees/ does not exist, worktrees/ does not exist
+   - Check CLAUDE.md: no worktree preference
+   - Ask user → user chooses .worktrees/
+   - Verify ignored: not ignored → add to .gitignore and commit
+   - Create worktree: git worktree add .worktrees/issue-42 -b issue-42
+   - cd .worktrees/issue-42
+   - Run setup: pip install -r requirements.txt
+   - Baseline tests: pytest tests/ → 38 passed, 0 failed
 3. Phase 2 — Parallel analysis:
    - issue-analyzer:
      - has_plan: false
@@ -82,6 +93,7 @@ AI:
 7. Completion:
    - Present summary
    - User opts to push branch and create PR
+   - User opts to keep worktree for now
 ```
 
 ---
@@ -93,8 +105,11 @@ User: #55
 
 AI:
 1. Extract issue number: 55
-2. Phase 1 — Branch management:
-   - Create and switch to issue-55
+2. Phase 1 — Worktree setup:
+   - .worktrees/ exists and is ignored
+   - Check existing worktrees: issue-55 worktree already exists
+   - cd into .worktrees/issue-55
+   - Baseline tests: pytest tests/ → 45 passed, 0 failed
 3. Phase 2 — Parallel analysis:
    - issue-analyzer:
      - has_plan: false
@@ -119,4 +134,5 @@ AI:
 8. Completion:
    - Present summary
    - Offer next steps
+   - Offer to remove worktree (user declines, wants to keep it)
 ```

@@ -45,7 +45,7 @@ Extract issue numbers from:
 
 ## Execution Flow
 
-### Phase 1: Branch Management
+### Phase 1: Branch Management & Worktree Setup
 
 1. Extract issue number from user input
 2. Fetch issue basics:
@@ -54,19 +54,50 @@ Extract issue numbers from:
    ```
    - Issue does not exist → stop, prompt user to check number
    - Issue is closed → ask whether to reopen or continue
-3. Check local branches:
+3. Determine worktree directory:
+   - Check existing directories in priority order:
+     ```bash
+     ls -d .worktrees 2>/dev/null || ls -d worktrees 2>/dev/null
+     ```
+   - If `.worktrees/` exists → use it
+   - If `worktrees/` exists → use it
+   - If neither exists → check `CLAUDE.md` for worktree preference
+   - If no preference found → ask user (default `.worktrees/`)
+   - For project-local directories, verify ignored:
+     ```bash
+     git check-ignore -q .worktrees 2>/dev/null || git check-ignore -q worktrees 2>/dev/null
+     ```
+     - Not ignored → add to `.gitignore`, commit, then proceed
+4. Check for existing worktree:
    ```bash
-   git branch --list '*{number}*'
+   git worktree list
    ```
-   - Branch exists with uncommitted changes → ask: continue, stash, or create new branch
-   - Branch exists clean → switch to it
-   - No branch → checkout main/master, pull, create `issue-{number}`
-4. Branch naming:
+   - If worktree for `issue-{number}` exists → `cd` into it, skip to step 6
+5. Create worktree with new branch:
+   ```bash
+   git worktree add <worktree-dir>/issue-{number} -b issue-{number}
+   cd <worktree-dir>/issue-{number}
+   ```
+   Branch naming:
    ```
    issue-{number}           # default
    feature/issue-{number}   # complex feature
    fix/issue-{number}       # bug fix
    ```
+6. Run project setup (auto-detect):
+   ```bash
+   [ -f package.json ] && npm install
+   [ -f Cargo.toml ] && cargo build
+   [ -f requirements.txt ] && pip install -r requirements.txt
+   [ -f pyproject.toml ] && poetry install
+   [ -f go.mod ] && go mod download
+   ```
+7. Verify clean baseline (optional but recommended):
+   - Run project-appropriate test command
+   - If tests fail → report to user, ask whether to proceed
+   - If tests pass → report ready
+
+All subsequent phases operate inside the worktree directory.
 
 ### Phase 2: Issue Analysis
 
@@ -171,7 +202,14 @@ Only when issue has no built-in plan.
 When triggered, execute in this exact order:
 
 1. **Extract issue number** from user input (or prompt)
-2. **Phase 1**: Run branch management steps
+2. **Phase 1**: Set up worktree and branch
+   - Determine worktree directory (`.worktrees/` or `worktrees/`)
+   - Verify directory is ignored (project-local)
+   - Check for existing worktree with `git worktree list`
+   - Create worktree: `git worktree add <dir>/issue-{number} -b issue-{number}`
+   - `cd` into worktree
+   - Run auto-detected project setup
+   - Run baseline tests
 3. **Phase 2**: Launch issue-analyzer + repo-scanner in parallel
    - Handle uncertainties if any
    - Route to Phase 3 or 4 based on `has_plan`
@@ -181,6 +219,10 @@ When triggered, execute in this exact order:
    - Commit every 1-2 tasks
 6. **Phase 5**: Launch test-verifier, handle failures, then launch change-summarizer
 7. **Wrap up**: Present summary, offer push and PR creation
+   - Optionally offer to remove worktree after PR is created:
+     ```bash
+     git worktree remove <worktree-path>
+     ```
 
 ## Subagent Reference
 
