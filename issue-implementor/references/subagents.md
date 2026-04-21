@@ -62,10 +62,12 @@ Analyze a GitHub issue and extract structured information.
 
 Scan the repository structure and identify relevant files for an issue.
 
+**Dispatch:** Launch with `work_dir=$WORKTREE_PATH` so file tools operate in the worktree.
+
 **Input:**
 - Issue title
 - Issue body (first 500 chars)
-- Project root directory listing
+- Project root directory listing (from worktree)
 
 **Output:** JSON
 ```json
@@ -94,6 +96,8 @@ Scan the repository structure and identify relevant files for an issue.
    ```bash
    grep -r "keyword" --include="*.py" --include="*.ts" -l . 2>/dev/null | head -20
    ```
+   > Because the subagent runs with `work_dir=$WORKTREE_PATH`, relative paths
+   > like `.` resolve to the worktree root automatically.
 3. List the most likely files to modify with reasons
 4. Summarize project conventions: directory structure, naming, architecture patterns
 5. Identify the test framework and standard test command
@@ -209,6 +213,8 @@ Break a solution into ordered, independently executable tasks.
 
 Execute a single task from the task plan.
 
+**Dispatch:** Launch with `work_dir=$WORKTREE_PATH` so file tools operate in the worktree.
+
 **Input:**
 - Single task object from task-planner
 - Project context (tech_stack, project_patterns, test_setup)
@@ -238,13 +244,14 @@ Execute a single task from the task plan.
    - `delete`: Use `Shell` with `git rm` or mark for deletion
 3. Follow repo-scanner's identified patterns and existing code style
 4. Add necessary comments and docstrings
-5. Run the task's `test_command` if provided
+5. Run the task's `test_command` if provided. Prefix with `cd $WORKTREE_PATH && ` if needed.
 6. Return result JSON
 
 **Constraints:**
 - Handle only one task at a time; do not implement future tasks prematurely
 - Use precise line-range replacements when modifying files
 - Do not add new dependencies unless necessary; if added, explicitly state why
+- File paths in `files_changed` should be relative to the worktree root
 
 ---
 

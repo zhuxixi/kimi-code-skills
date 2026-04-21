@@ -19,7 +19,7 @@ AI:
    - cd .worktrees/issue-27
    - Run setup: pip install -r requirements.txt
    - Baseline tests: pytest tests/ → 42 passed, 0 failed
-3. Phase 2 — Parallel analysis:
+3. Phase 2 — Parallel analysis (both with work_dir=$WORKTREE_PATH):
    - issue-analyzer:
      - has_plan: true
      - plan_summary: "Implement JWT validation in middleware/auth.py"
@@ -30,7 +30,7 @@ AI:
      - relevant_files: [src/middleware/auth.py, src/config.py]
      - test_setup: pytest tests/
    - has_plan = true → skip Phase 3
-4. Phase 4 — Implementation:
+4. Phase 4 — Implementation (all subagents with work_dir=$WORKTREE_PATH):
    - task-planner outputs 3 tasks:
      1. Create src/utils/jwt_helper.py
      2. Modify src/middleware/auth.py
@@ -38,7 +38,7 @@ AI:
    - impl-executor runs each task sequentially
    - Tests pass after each task
    - Commit after task 2 and task 3
-5. Phase 5 — Verification:
+5. Phase 5 — Verification (both with work_dir=$WORKTREE_PATH):
    - test-verifier: all requirements met, 42 passed, 0 failed
    - change-summarizer produces Markdown summary
 6. Completion:
@@ -65,7 +65,7 @@ AI:
    - cd .worktrees/issue-42
    - Run setup: pip install -r requirements.txt
    - Baseline tests: pytest tests/ → 38 passed, 0 failed
-3. Phase 2 — Parallel analysis:
+3. Phase 2 — Parallel analysis (both with work_dir=$WORKTREE_PATH):
    - issue-analyzer:
      - has_plan: false
      - requirements: ["Improve search response speed"]
@@ -75,7 +75,7 @@ AI:
      - tech_stack: Python / Django / PostgreSQL
      - relevant_files: [src/search/views.py, src/search/queries.py]
      - project_patterns: "ORM queries in queries.py, views handle HTTP layer"
-4. Phase 3 — Solution design:
+4. Phase 3 — Solution design (work_dir=$WORKTREE_PATH):
    - solution-designer proposes:
      - Approach: Add Redis caching layer for frequent search queries
      - New files: src/search/cache.py
@@ -83,7 +83,7 @@ AI:
      - Risks: ["Cache invalidation on data updates"]
    - Present plan to user
    - User confirms
-5. Phase 4 — Implementation:
+5. Phase 4 — Implementation (all subagents with work_dir=$WORKTREE_PATH):
    - task-planner breaks into 5 tasks
    - impl-executor executes each
    - One test fails on task 3 → feed error back → impl-executor fixes → passes
@@ -110,7 +110,7 @@ AI:
    - Check existing worktrees: issue-55 worktree already exists
    - cd into .worktrees/issue-55
    - Baseline tests: pytest tests/ → 45 passed, 0 failed
-3. Phase 2 — Parallel analysis:
+3. Phase 2 — Parallel analysis (both with work_dir=$WORKTREE_PATH):
    - issue-analyzer:
      - has_plan: false
      - requirements: ["Add OAuth authentication"]
@@ -124,13 +124,13 @@ AI:
      - "Support protocols other than OAuth 2.0?"
      - "What should the token expiration time be?"
    - User replies: "Only OAuth 2.0, 1 hour expiration"
-5. Re-run issue-analyzer with clarified context:
+5. Re-run issue-analyzer with clarified context (work_dir=$WORKTREE_PATH):
    - uncertainties: []
    - has_plan: false
-6. Phase 3 — Solution design:
+6. Phase 3 — Solution design (work_dir=$WORKTREE_PATH):
    - solution-designer creates plan
    - User confirms
-7. Phases 4-5 — Implementation and verification proceed normally
+7. Phases 4-5 — Implementation and verification proceed normally (all subagents with work_dir=$WORKTREE_PATH)
 8. Completion:
    - Present summary
    - Offer next steps

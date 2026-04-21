@@ -1,11 +1,14 @@
 ---
 name: issue-implementor
 description: |
-  Implement GitHub Issues end-to-end using subagent-driven development. Automates branch management,
-  issue analysis, solution design, task planning, implementation, and verification.
+  Implement GitHub Issues end-to-end using subagent-driven development. Automates worktree setup,
+  branch management, issue analysis, solution design, task planning, implementation, and verification.
   Use when user mentions: "实现 issue", "开发 issue", "fix issue", "implement issue",
   or any message containing an issue reference like "#123", "issue #42", "#27".
   Also triggers on requests to implement, fix, or develop a specific GitHub issue number.
+  Creates an isolated git worktree for each issue and dispatches specialized subagents
+  (issue-analyzer, repo-scanner, solution-designer, task-planner, impl-executor,
+  test-verifier, change-summarizer) to complete the work.
 ---
 
 # Issue Implementor
@@ -73,42 +76,49 @@ Extract issue numbers from:
    git worktree list
    ```
    - If worktree for `issue-{number}` exists → `cd` into it, skip to step 6
-5. Create worktree with new branch:
+5. Create worktree with new branch and record absolute path:
    ```bash
    git worktree add <worktree-dir>/issue-{number} -b issue-{number}
-   cd <worktree-dir>/issue-{number}
    ```
+   - Record the absolute path of the worktree as `$WORKTREE_PATH`
+   - This path must be passed to every subagent via the `work_dir` parameter
    Branch naming:
    ```
    issue-{number}           # default
    feature/issue-{number}   # complex feature
    fix/issue-{number}       # bug fix
    ```
-6. Run project setup (auto-detect):
+6. Run project setup inside worktree (auto-detect):
    ```bash
-   [ -f package.json ] && npm install
-   [ -f Cargo.toml ] && cargo build
-   [ -f requirements.txt ] && pip install -r requirements.txt
-   [ -f pyproject.toml ] && poetry install
-   [ -f go.mod ] && go mod download
+   cd $WORKTREE_PATH && [ -f package.json ] && npm install
+   cd $WORKTREE_PATH && [ -f Cargo.toml ] && cargo build
+   cd $WORKTREE_PATH && [ -f requirements.txt ] && pip install -r requirements.txt
+   cd $WORKTREE_PATH && [ -f pyproject.toml ] && poetry install
+   cd $WORKTREE_PATH && [ -f go.mod ] && go mod download
    ```
-7. Verify clean baseline (optional but recommended):
-   - Run project-appropriate test command
+   > **Important:** Each Shell command must explicitly `cd $WORKTREE_PATH` because
+   > Shell sessions do not persist working-directory changes across calls.
+7. Verify clean baseline inside worktree (optional but recommended):
+   - Run project-appropriate test command with `cd $WORKTREE_PATH && ...`
    - If tests fail → report to user, ask whether to proceed
    - If tests pass → report ready
 
-All subsequent phases operate inside the worktree directory.
+All subsequent phases operate inside the worktree directory. Every subagent
+must be launched with `work_dir=$WORKTREE_PATH` (absolute path) so its file
+tools and Shell commands operate in the correct directory.
 
 ### Phase 2: Issue Analysis
 
 Launch two parallel `Agent` instances:
 
 1. **issue-analyzer** — analyze issue content
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: issue title, body, labels, comments
    - Output: `{has_plan, plan_summary, requirements, issue_type, complexity, affected_areas, uncertainties}`
    - See [references/subagents.md](references/subagents.md#issue-analyzer) for full definition
 
 2. **repo-scanner** — scan codebase structure
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: issue title, body preview, project root listing
    - Output: `{tech_stack, relevant_files, project_patterns, test_setup}`
    - See [references/subagents.md](references/subagents.md#repo-scanner) for full definition
@@ -123,6 +133,7 @@ After collecting both outputs:
 Only when issue has no built-in plan.
 
 1. Launch **solution-designer**
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: issue-analyzer output + repo-scanner output + contents of relevant files
    - Output: `{approach_summary, files_to_create, files_to_modify, files_to_read, estimated_effort, risks, testing_strategy}`
    - See [references/subagents.md](references/subagents.md#solution-designer) for full definition
@@ -149,12 +160,13 @@ Only when issue has no built-in plan.
 ### Phase 4: Implementation
 
 1. Launch **task-planner**
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: solution info (from issue plan or designed solution) + repo-scanner context
    - Output: ordered task list `{tasks: [{id, description, files, action, test_command, estimated_time}]}`
    - See [references/subagents.md](references/subagents.md#task-planner) for full definition
 
 2. Execute tasks sequentially with **impl-executor**
-   - One `Agent` per task
+   - One `Agent` per task, each with `work_dir=$WORKTREE_PATH`
    - Input: single task + project context + current file contents
    - Output: `{status, summary, files_changed}`
    - See [references/subagents.md](references/subagents.md#impl-executor) for full definition
@@ -173,6 +185,7 @@ Only when issue has no built-in plan.
 ### Phase 5: Verification & Completion
 
 1. Launch **test-verifier**
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: original requirements + full git diff + test setup info
    - Output: `{all_requirements_met, tests_pass, test_summary, regressions, issues, recommendations}`
    - See [references/subagents.md](references/subagents.md#test-verifier) for full definition
@@ -183,18 +196,23 @@ Only when issue has no built-in plan.
    - Fix chosen → return to Phase 4 with correction tasks
 
 3. Launch **change-summarizer**
+   - Launch with `work_dir=$WORKTREE_PATH`
    - Input: full diff + task list + test-verifier result
    - Output: Markdown summary
    - See [references/subagents.md](references/subagents.md#change-summarizer) for full definition
 
 4. Present summary to user, then ask:
-   - Push branch?
+   - Push branch from worktree?
      ```bash
-     git push -u origin issue-{number}
+     cd $WORKTREE_PATH && git push -u origin issue-{number}
      ```
    - Create PR?
      ```bash
-     gh pr create --title "Fix #${number}: {issue_title}" --body "{summary}"
+     cd $WORKTREE_PATH && gh pr create --title "Fix #${number}: {issue_title}" --body "{summary}"
+     ```
+   - Remove worktree?
+     ```bash
+     git worktree remove $WORKTREE_PATH
      ```
 
 ## Internal Execution Template
@@ -207,21 +225,25 @@ When triggered, execute in this exact order:
    - Verify directory is ignored (project-local)
    - Check for existing worktree with `git worktree list`
    - Create worktree: `git worktree add <dir>/issue-{number} -b issue-{number}`
-   - `cd` into worktree
-   - Run auto-detected project setup
-   - Run baseline tests
+   - Record absolute path as `$WORKTREE_PATH`
+   - Run auto-detected project setup inside worktree (`cd $WORKTREE_PATH && ...`)
+   - Run baseline tests inside worktree
 3. **Phase 2**: Launch issue-analyzer + repo-scanner in parallel
+   - Both subagents launched with `work_dir=$WORKTREE_PATH`
    - Handle uncertainties if any
    - Route to Phase 3 or 4 based on `has_plan`
-4. **Phase 3** (if needed): Launch solution-designer, present to user, wait for confirmation
-5. **Phase 4**: Launch task-planner, then loop through tasks with impl-executor
-   - Run per-task tests
-   - Commit every 1-2 tasks
-6. **Phase 5**: Launch test-verifier, handle failures, then launch change-summarizer
+4. **Phase 3** (if needed): Launch solution-designer with `work_dir=$WORKTREE_PATH`,
+   present to user, wait for confirmation
+5. **Phase 4**: Launch task-planner with `work_dir=$WORKTREE_PATH`,
+   then loop through tasks with impl-executor (each with `work_dir=$WORKTREE_PATH`)
+   - Run per-task tests (`cd $WORKTREE_PATH && <test-command>`)
+   - Commit every 1-2 tasks (`cd $WORKTREE_PATH && git commit ...`)
+6. **Phase 5**: Launch test-verifier with `work_dir=$WORKTREE_PATH`,
+   handle failures, then launch change-summarizer with `work_dir=$WORKTREE_PATH`
 7. **Wrap up**: Present summary, offer push and PR creation
    - Optionally offer to remove worktree after PR is created:
      ```bash
-     git worktree remove <worktree-path>
+     git worktree remove $WORKTREE_PATH
      ```
 
 ## Subagent Reference
