@@ -434,8 +434,8 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 
 2. 使用 `Agent` + `run_in_background=true` 启动 pr-watcher agent：
    - `description`: `"PR change watcher"`（简短，用于 TaskList 显示）
-   - `prompt`: 包含 PR 编号、仓库 owner/repo、`base_sha`、轮询间隔（默认 300s）、最大等待时间（默认 3600s）
-   - `timeout`: 3600（1 小时，与 `print_wait_ceiling_s` 配合）
+   - `prompt`: 包含 PR 编号、仓库 owner/repo、`base_sha`、轮询间隔（默认 120s）、最大等待时间（默认 1200s）
+   - `timeout`: 1200（20 分钟，覆盖完整监控周期）
 
 3. 输出到终端：
    ```
@@ -599,7 +599,7 @@ reason 字段应为 "logic" 或 "security"。
 **任务**:
 1. 记录 `start_time`
 2. 循环执行（最多 `max_iterations = max_wait_s / poll_interval_s` 次）：
-   a. `Shell: sleep {poll_interval_s}`
+   a. `Shell: sleep {poll_interval_s}`（跨平台：`sleep` 在 PowerShell 和 Unix shell 中均可用；调用时必须设置 `timeout` 大于轮询间隔，如 `timeout: 180`）
    b. `Shell: gh pr view {PR} --json headRefOid,state,reviewDecision`
    c. 如果 `state` 为 `CLOSED` 或 `MERGED` → 输出 `"PR state changed to {state}"` → 结束
    d. 如果 `reviewDecision` 为 `APPROVED` → 输出 `"All reviewers approved"` → 结束
@@ -1263,14 +1263,14 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 - PR 编号: {pr_number}
 - 仓库 owner/repo: {owner}/{repo}
 - 监控开始时的 head SHA: {base_sha}
-- 轮询间隔: {poll_interval_s} 秒（默认 300）
-- 最大等待时间: {max_wait_s} 秒（默认 3600）
+- 轮询间隔: {poll_interval_s} 秒（默认 120）
+- 最大等待时间: {max_wait_s} 秒（默认 1200）
 
 执行流程：
 
 1. 记录 start_time = 当前时间
 2. 循环执行（最多 {max_iterations} 次）：
-   a. `Shell: sleep {poll_interval_s}`
+   a. `Shell: sleep {poll_interval_s}`（跨平台：`sleep` 在 PowerShell 和 Unix shell 中均可用；调用时必须设置 `timeout` 大于轮询间隔，如 `timeout: 180`）
    b. `Shell: gh pr view {pr_number} --json headRefOid,state,reviewDecision`
       → 解析 JSON，获取当前 head SHA、state、reviewDecision
 
