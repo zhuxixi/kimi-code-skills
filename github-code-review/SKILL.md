@@ -85,17 +85,43 @@ gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .s
 
 解析 metadata 字段：`round`, `head_sha`, `previous_head_sha`, `issues`。
 
+#### 0.2a 读取并解析 committer 回应
+
+对于增量审查，在提取 previous_issues 后，需要读取 committer 对上一轮 issues 的回应，避免重复标记已解释/已拒绝修复的问题。
+
+**执行步骤：**
+
+1. 使用 `Shell` 执行 `gh pr view <PR> --comments` 获取所有 PR 评论
+2. 过滤掉 Kimi CR 评论（body 包含 `"Generated with Kimi Code CLI"`），保留 committer / human reviewer 的评论
+3. 对每个 `status="open"` 的 previous issue，检查 committer 评论中是否提及该 issue：
+   - 匹配方式：issue 描述前 10 个单词、或 `file:lines` 组合、或 `"issue-{id}"` 引用
+4. **分类 committer 回应**（关键词匹配，不区分大小写）：
+
+| 信号关键词 | 分类 (`resolution`) | 处理方式 |
+|-----------|---------------------|---------|
+| "wontfix", "won't fix", "by design", "intentional", "not a bug", "不需要修复", "不修复", "设计如此" | `wontfix` | 标记为 acknowledged，不列入 "Still open" |
+| "fixed", "已修复", "done", "resolved", "addressed" | `resolved` | 标记 `status="resolved"`（delta-reviewer 再验证） |
+| "clarify", "说明", "actually", "context:", "returns", "只返回", "strictly" | `clarified` | 添加 `committer_note`，传递给 delta-reviewer |
+| 无明确信号 | `null` | 无变化，按原有流程处理 |
+
+5. 当分类为 `wontfix` 或 `clarified` 时，在对应 issue 上增加字段：
+   - `resolution`: `"acknowledged"` / `"wontfix"` / `"resolved"` / `null`
+   - `committer_note`: committer 评论中的相关原文片段
+
+**注意**：分类是启发式的。不确定时，优先分类为 `clarified` 而非 `wontfix`，以保留人工判断空间。
+
 #### 0.3 判断分支
 
 **有 previous review metadata？**
 - 是 → 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取当前 head SHA
   - 当前 SHA == `previous_head_sha` → **无新 commit**
     - 输出：`"No new commits since Round-{round} review. Previous issues may still be open."`
-    - 列出仍 open 的 issues
+    - 列出仍 open 的 issues（排除已标记 `resolution="acknowledged"` / `"wontfix"` 的）
     - 不启动 watcher，结束
   - 当前 SHA != `previous_head_sha` → **有新 commit**
     - 标记当前为 `Round = round + 1`
     - 提取 `previous_issues = issues`
+    - **执行 Step 0.2a**：读取并解析 committer 对上一轮 issues 的回应，更新 `previous_issues` 的 `resolution` 和 `committer_note` 字段
     - 进入【增量审查流程】，跳过 Step 1-9
 - 否 → 首次审查 → 走完整流程（Round = 1）
 
@@ -339,10 +365,14 @@ Metadata 字段：
 - `pr_number`: PR 编号
 - `head_sha`: 当前 PR head commit 的完整 SHA（40 字符）
 - `previous_head_sha`: 上一轮 review 时的 head SHA（Round-1 为 null）
-- `total_issues`: 当前轮次统计的问题总数
+- `total_issues`: 当前轮次统计的问题总数（不含 acknowledged）
 - `resolved_count`: 本轮标记为 resolved 的问题数（Round-1 为 0）
 - `new_count`: 本轮新发现的问题数
-- `issues`: 问题数组，每个元素含 `status`（"open" 或 "resolved"）
+- `acknowledged_count`: 本轮标记为 acknowledged / wontfix 的问题数
+- `issues`: 问题数组，每个元素含：
+  - `status`（"open" 或 "resolved"）
+  - `resolution`（"acknowledged" / "wontfix" / "resolved" / null）
+  - `committer_note`（string 或 null）
 - `timestamp`: ISO 8601 格式时间戳
 
 **Part B: Markdown 人类可读部分**
@@ -366,9 +396,14 @@ Round-N（N ≥ 2，增量审查）格式：
 
 Previous Round-{N-1} issues: {M}
 - **Resolved**: {R} ({resolved_issue_descriptions})
-- **Still open**: {M-R}
+- **Acknowledged / Won't Fix**: {A} ({acknowledged_issue_descriptions})
+- **Still open**: {M - R - A}
 
 New issues found: {new_count}
+
+#### Acknowledged / Won't Fix
+
+{acknowledged_issue_list}
 
 #### Still Open from Previous Rounds
 
@@ -380,6 +415,11 @@ New issues found: {new_count}
 
 🤖 Generated with Kimi Code CLI
 ```
+
+说明：
+- 如果 `acknowledged_issues` 为空，省略 "Acknowledged / Won't Fix" 小节及其标题
+- Acknowledged issues 不计入 "Still open" 数量
+- 它们也不触发 watcher 继续监控（watcher 只关注真正 open 的 issues）
 
 All issues resolved 格式：
 ```markdown
@@ -503,6 +543,9 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 | Round 编号溢出（>99） | 继续递增，无上限 |
 | re-entry 时 PR 已关闭 | Re-entry Step R2 捕获，不执行增量审查 |
 | re-entry 时 delta-reviewer 失败 | 输出错误信息，不启动新 watcher |
+| committer 评论中无明确信号 | 分类为 null，按原有流程处理 |
+| committer 回应与代码实际不符 | delta-reviewer 结合 diff 判断，以代码为准 |
+| 所有 open issues 被标记 acknowledged | 不启动 watcher，输出 "All remaining issues acknowledged by committer" |
 
 ## SubAgent 详细定义
 
@@ -615,18 +658,22 @@ reason 字段应为 "logic" 或 "security"。
 
 ### delta-reviewer
 
-**输入**: PR 完整 diff、previous_issues 列表、previous_head_sha、current_head_sha、相关规范文件
-**输出**: JSON `{resolved_issues, new_issues, unresolved_issues, pass}`
+**输入**: PR 完整 diff、previous_issues 列表（含 `resolution` 和 `committer_note` 字段）、previous_head_sha、current_head_sha、相关规范文件
+**输出**: JSON `{resolved_issues, acknowledged_issues, new_issues, unresolved_issues, pass}`
 
 **任务**:
-1. 对比 `previous_issues` 和当前 diff：
-   - 遍历每个 previous issue，检查其 `file` + `lines` 范围是否在 diff 中被修改
+1. 处理带 committer 回应的 previous issues：
+   - `resolution="acknowledged"` / `"wontfix"` → 加入 `acknowledged_issues`，不再视为 open
+   - `resolution="clarified"`（有 `committer_note`）→ 结合澄清内容判断 issue 是否仍有效。如果澄清使 issue 失效，标记为 resolved 并引用澄清；否则加入 `unresolved_issues`
+   - `resolution=null` → 进入下一步 diff 对比
+2. 对比 `previous_issues` 和当前 diff：
+   - 遍历每个 previous issue（无 resolution 或 resolution=null），检查其 `file` + `lines` 范围是否在 diff 中被修改
    - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 `resolved_issues`
    - 未修改 → 加入 `unresolved_issues`
-2. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 `new_issues`
+3. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 `new_issues`
    - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
    - 仔细审查修复代码本身的正确性
-3. 对于规范类问题，检查 CLAUDE.md / AGENTS.md 中相关规则是否仍适用
+4. 对于规范类问题，检查 CLAUDE.md / AGENTS.md 中相关规则是否仍适用
 
 **输出 JSON 格式**:
 ```json
@@ -639,6 +686,16 @@ reason 字段应为 "logic" 或 "security"。
       "file": "src/auth.ts",
       "lines": "67-72",
       "resolution_note": "Error handling added in new commit"
+    }
+  ],
+  "acknowledged_issues": [
+    {
+      "original_id": "issue-2",
+      "description": "/shutdown endpoint lacks authentication",
+      "reason": "logic",
+      "file": "src/server.py",
+      "lines": "45-50",
+      "committer_note": "daemon binds to localhost only, authentication not needed for local service"
     }
   ],
   "new_issues": [
@@ -667,6 +724,7 @@ reason 字段应为 "logic" 或 "security"。
 **约束**:
 - 只关注被修改的代码，不评论原有代码
 - 对于已修复的问题，必须简要说明修复方式（`resolution_note`）
+- 对于 acknowledged 的问题，保留 `committer_note`
 - 对于未修复的问题，保持原描述不变
 - 新问题使用新的 `id`，不影响原有 issue 编号
 
@@ -680,8 +738,9 @@ reason 字段应为 "logic" 或 "security"。
    - 否则：使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
    - 筛选含 `"Generated with Kimi Code CLI"` 和 `"<!-- kimi-cr-meta"` 的评论
    - 提取最新一轮的 JSON metadata
+   - **执行 Step 0.2a**：使用 `gh pr view <PR> --comments` 获取所有评论，解析 committer 回应，更新 previous_issues
    - 对比 `previous_head_sha` 与当前 `headRefOid`
-   - 无新 commit → 输出状态报告并结束
+   - 无新 commit → 输出状态报告并结束（排除 acknowledged issues）
    - 有新 commit → 标记 `Round = N + 1`，进入【增量审查流程】
    - 无 previous review → `Round = 1`，继续下一步
 
@@ -776,6 +835,7 @@ reason 字段应为 "logic" 或 "security"。
 3. 使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
 4. 筛选 Kimi CR 评论，提取最新一轮 metadata（同 Step 0.2）
 5. 获取 `previous_issues` 列表和 `previous_head_sha`
+6. **执行 Step 0.2a**：使用 `gh pr view <PR> --comments` 获取所有评论，解析 committer 对 open issues 的回应，更新 `previous_issues` 的 `resolution` 和 `committer_note` 字段
 
 **Step R3: 获取完整 diff**
 
@@ -795,8 +855,9 @@ reason 字段应为 "logic" 或 "security"。
 - `previous_head_sha = previous_head_sha`
 - `head_sha = 当前 headRefOid`
 - `resolved_count = len(resolved_issues)`
+- `acknowledged_count = len(acknowledged_issues)`
 - `new_count = len(new_issues)`
-- issues 列表中已修复的标记 `status="resolved"`，未修复的标记 `status="open"`，新问题标记 `status="open"`
+- issues 列表中已修复的标记 `status="resolved"`，未修复的标记 `status="open"`，新问题标记 `status="open"`，acknowledged 的标记 `status="open"` + `resolution="acknowledged"`
 
 **Step R6: 决定是否继续监控**
 
@@ -893,13 +954,16 @@ delta-reviewer 输出 JSON：
 **Step Δ4: 汇总问题列表**
 
 构建当前轮次的完整 issues 列表：
-- `resolved_issues` → 保留原 `id`，标记 `status="resolved"`
-- `unresolved_issues` → 保留原 `id`，标记 `status="open"`
+- `resolved_issues` → 保留原 `id`，标记 `status="resolved"`，`resolution="resolved"`
+- `acknowledged_issues` → 保留原 `id`，标记 `status="open"`，`resolution="acknowledged"`，保留 `committer_note`
+- `unresolved_issues` → 保留原 `id`，标记 `status="open"`，`resolution=null`
 - `new_issues` → 生成新 `id`（如 `"issue-{max_id+1}"`），标记 `status="open"`，`first_round = current_round`
 
 **Step Δ5: 继续至 Step 6（过滤与汇总）**
 
 将汇总后的问题列表传入 Step 6，继续执行 Step 6-9-10 的标准流程。
+
+注意：Step 10 启动 watcher 的条件是存在 `status="open"` **且** `resolution != "acknowledged"` 的 issues。
 
 ### 与完整流程的区别
 
@@ -995,20 +1059,25 @@ No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
 🤖 Generated with Kimi Code CLI
 ```
 
-### Round-2 增量审查输出（部分问题已修复）
+### Round-2 增量审查输出（部分问题已修复，部分被 committer 拒绝修复）
 
 ```markdown
 <!-- kimi-cr-meta
-{"round":2,"pr_number":123,"head_sha":"fed789abc0123456789012345678901234567890","previous_head_sha":"abc123def4567890123456789012345678901234","total_issues":1,"resolved_count":2,"new_count":0,"issues":[{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1}],"timestamp":"2026-04-21T10:30:00Z"}
+{"round":2,"pr_number":123,"head_sha":"fed789abc0123456789012345678901234567890","previous_head_sha":"abc123def4567890123456789012345678901234","total_issues":1,"resolved_count":1,"acknowledged_count":1,"new_count":0,"issues":[{"id":"issue-2","description":"Daemon binds to localhost only, no auth needed","reason":"logic","file":"src/server.py","lines":"45-50","status":"open","first_round":1,"resolution":"acknowledged","committer_note":"daemon binds to localhost only, authentication not needed for local service"},{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1,"resolution":null,"committer_note":null}],"timestamp":"2026-04-21T10:30:00Z"}
 -->
 
 ### Code Review | Round-2 (Re-check)
 
 Previous Round-1 issues: 3
-- **Resolved**: 2 (Missing error handling, Inconsistent naming)
+- **Resolved**: 1 (Missing error handling)
+- **Acknowledged / Won't Fix**: 1
 - **Still open**: 1
 
 New issues found: 0
+
+#### Acknowledged / Won't Fix
+
+2. Daemon binds to localhost only, no auth needed (committer: daemon binds to localhost only, authentication not needed for local service)
 
 #### Still Open from Round-1
 
@@ -1303,21 +1372,24 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 
 输入：
 - PR 完整 diff：{diff}
-- 上一轮问题列表：{previous_issues}
+- 上一轮问题列表：{previous_issues}（每个 issue 可能含 resolution 和 committer_note 字段）
 - 上一轮 head SHA：{previous_head_sha}
 - 当前 head SHA：{current_head_sha}
 - 相关规范文件：{guidelines}
 
 要求：
-1. 遍历每个 previous issue，检查其 file + lines 范围是否在 diff 中被修改：
+1. 优先处理带 committer 回应的 issues：
+   - resolution="acknowledged" / "wontfix" → 加入 acknowledged_issues，不再视为 open
+   - resolution="clarified"（有 committer_note）→ 结合澄清内容判断。如果澄清使 issue 失效，标记 resolved 并引用澄清；否则加入 unresolved_issues
+2. 遍历其余 previous issue（resolution 为 null），检查其 file + lines 范围是否在 diff 中被修改：
    - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 resolved_issues，附 resolution_note
    - 未修改 → 加入 unresolved_issues
-2. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 new_issues
+3. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 new_issues
    - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
    - 仔细审查修复代码本身的正确性
-3. 忽略已确认 resolved 的旧问题
-4. 对于规范类问题，确认规则是否仍适用于当前变更
-5. 输出 JSON：{"resolved_issues": [...], "new_issues": [...], "unresolved_issues": [...], "pass": boolean}
+4. 忽略已确认 resolved 的旧问题
+5. 对于规范类问题，确认规则是否仍适用于当前变更
+6. 输出 JSON：{"resolved_issues": [...], "acknowledged_issues": [...], "new_issues": [...], "unresolved_issues": [...], "pass": boolean}
 ```
 
 ## 审查结果示例解析
