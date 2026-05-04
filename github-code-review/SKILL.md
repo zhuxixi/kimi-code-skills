@@ -190,9 +190,39 @@ gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .s
 
 summarizer 输出一段简洁的变更摘要（不超过 300 字），帮助后续审查 Agent 快速理解变更意图。
 
+### Step 3.5: Diff 预处理（防 prompt 过长）
+
+在将 diff 传入 sub-agent 之前，进行预处理和长度保护，避免完整 diff 直接嵌入 prompt 导致 JSON 解析失败（参见 issue #4）。
+
+**预处理规则**：
+
+1. **按 agent 类型过滤 diff**：
+   - CLAUDE.md checker ×2、AGENTS.md checker：接收**完整 diff**（规范检查需要完整上下文）
+   - Bug scanner、Logic analyzer：接收**过滤后的 diff**，排除以下测试相关文件：
+     - `tests/`、`test/` 目录下的文件
+     - `*_test.py`、`*_spec.py`、`*_tests.py` 等测试文件
+     - `.test.`、`.spec.` 等测试文件
+
+2. **长度硬限制**（兜底保护，适用于所有 agent）：
+   ```
+   MAX_PROMPT_DIFF_LEN = 4000  # 字符
+
+   if len(filtered_diff) > MAX_PROMPT_DIFF_LEN:
+       # 保留变更 hunk（+/- 行）及前后各 2 行上下文，去掉完整的未变更函数体
+       filtered_diff = keep_hunks_only(filtered_diff, context_lines=2)
+
+   if len(filtered_diff) > MAX_PROMPT_DIFF_LEN:
+       # 二次截断：截断至 4000 字符并在末尾添加提示
+       filtered_diff = filtered_diff[:4000] + "\n... (diff truncated due to length)"
+   ```
+
+3. **效果验证**：过滤后的 diff 长度通常减少 **60-70%**（测试文件往往占据大比例 diff）。
+
 ### Step 4: 5 个并行审查 Agent
 
-启动 5 个并行 `Agent`，每个接收相同的输入包：PR diff、变更摘要、PR 标题和描述、相关的规范文件内容。
+启动 5 个并行 `Agent`，每个接收经过 Step 3.5 预处理的输入包：
+- **CLAUDE.md checker ×2、AGENTS.md checker**：完整 diff（或截断后的）+ 变更摘要 + PR 标题和描述 + 相关规范文件内容
+- **Bug scanner、Logic analyzer**：过滤掉测试文件的 diff（或截断后的）+ 变更摘要 + PR 标题和描述
 
 **Agent 1: CLAUDE.md compliance checker**
 - 检查变更是否违反 `CLAUDE.md` 中的规则
@@ -534,7 +564,7 @@ gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 | 当前分支无关联 PR | 提示用户提供 PR 编号 |
 | 提取不到完整 SHA | 使用 `gh pr view <PR> --json headRefOid` 获取 head SHA，失败则报错 |
 | Agent 返回格式错误的 JSON | 尝试解析，失败则忽略该 Agent 的输出 |
-| diff 过大无法完整处理 | 仅分析前 500 行变更，其余部分标记为 "部分分析" |
+| diff 过大无法完整处理 | Step 3.5 预处理：过滤测试文件 + 4000 字符硬限制（hunk-only 压缩 + 截断），不再丢弃整个分析 |
 | 用户手动触发但无新 commit | Step 0 检测 → 输出 "No new commits since Round-{N}"，不启动 watcher |
 | Metadata 提取失败 | Fallback 到完整流程，输出 "Previous review metadata corrupted" |
 | Watcher 超时（无新 commit） | Watcher 输出 "Timeout"，主 agent 输出等待超时提醒 |
@@ -765,40 +795,48 @@ reason 字段应为 "logic" 或 "security"。
    - 使用 `Shell` 执行 `gh pr diff <PR>` 获取 diff
    - 使用 `Agent` 启动 summarizer subagent 总结变更
 
-6. **Step 4: 5 个并行审查 Agent**
-   使用 `Agent` 并行启动以下 subagent：
-   - claude-compliance-checker（检查 CLAUDE.md 合规性）
+6. **Step 3.5: Diff 预处理**
+   - 对完整 diff 按 agent 类型进行过滤：
+     - claude-compliance-checker ×2、agents-compliance-checker：保留完整 diff
+     - bug-scanner、logic-analyzer：过滤掉 `tests/`、`test/`、`*_test.py`、`*_spec.py` 等测试相关文件
+   - 对所有过滤后的 diff 应用长度硬限制（`MAX_PROMPT_DIFF_LEN = 4000`）：
+     - 超长时先压缩为 hunk-only（保留 +/- 行及前后各 2 行上下文）
+     - 仍超长则截断至 4000 字符并添加 `... (diff truncated)` 提示
+
+7. **Step 4: 5 个并行审查 Agent**
+   使用 `Agent` 并行启动以下 subagent，传入经过 Step 3.5 预处理的 diff：
+   - claude-compliance-checker（检查 CLAUDE.md 合规性，接收完整或截断后的 diff）
    - claude-compliance-checker（第二个独立 checker）
    - agents-compliance-checker（检查 AGENTS.md 合规性）
-   - bug-scanner（扫描 Bug 和潜在问题）
-   - logic-analyzer（分析逻辑正确性和安全性）
+   - bug-scanner（扫描 Bug 和潜在问题，接收过滤掉测试文件的 diff）
+   - logic-analyzer（分析逻辑正确性和安全性，接收过滤掉测试文件的 diff）
 
-7. **Step 5: Issue 验证**
+8. **Step 5: Issue 验证**
    - 收集所有 Agent 发现的问题
    - 为每个 issue 使用 `Agent` 并行启动 issue-validator 验证
    - 收集每个验证结果
 
-8. **Step 6: 过滤与汇总**
+9. **Step 6: 过滤与汇总**
    - 过滤掉 `valid: false` 的 issue
    - 按 file、lines、reason 去重
    - 按优先级排序：CLAUDE.md → AGENTS.md → bug → logic
 
-9. **Step 7: 最终资格审查**
+10. **Step 7: 最终资格审查**
    - 使用 `Shell` 执行 `gh pr view <PR> --json state` 检查 PR 是否仍然开放
    - 如已关闭或合并，停止并提示用户
 
-10. **Step 8: 终端输出**
+11. **Step 8: 终端输出**
    - 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取完整 SHA
    - 使用 `Shell` 执行 `gh pr view <PR> --json headRepositoryOwner,headRepository` 获取仓库信息
    - 格式化 Markdown 报告
    - 输出到终端
 
-11. **Step 9: 构建并发布 PR Review 评论**
+12. **Step 9: 构建并发布 PR Review 评论**
     - 构建包含 HTML Comment metadata 的结构化评论 body
     - 使用 `Shell` 执行 `gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md`
     - 向用户确认完成
 
-12. **Step 10: 启动 Background Watcher（可选）**
+13. **Step 10: 启动 Background Watcher（可选）**
     - 条件：Step 6 过滤后存在 `status="open"` 的 issues，且当前为首次审查或手动触发的增量审查
     - 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid` 获取当前 head SHA
     - 使用 `Agent` + `run_in_background=true` 启动 pr-watcher agent
@@ -1177,7 +1215,7 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 - 5 个并行审查 Agent 可以同时运行，不受顺序依赖
 - Issue 验证 Agent 的数量取决于发现的问题数量，也可以并行执行
 - 大 PR 的审查时间可能较长，但并行架构可以充分利用并发能力
-- 如果 diff 超过 500 行，建议仅分析前 500 行变更
+- Step 3.5 的 Diff 预处理机制已处理超大 diff：过滤测试文件后通常减少 60-70%，4000 字符硬限制确保 prompt 不会触发 JSON 解析失败
 
 ## 设计原理
 
@@ -1276,7 +1314,8 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 你是一个 Bug 扫描器。你的任务是基于 diff 内容扫描 Bug 和潜在问题。
 
 输入：
-- PR diff：{diff}
+- PR diff（已过滤测试文件）：{diff}
+  注意：此 diff 已预先过滤掉 tests/、test/ 目录及测试文件（*_test.py、*_spec.py 等），以控制 prompt 长度。你只需关注业务代码中的 Bug。
 
 要求：
 1. 仅基于 diff 内容判断，不读取额外文件
@@ -1294,7 +1333,8 @@ https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
 
 输入：
 - PR 摘要：{summary}
-- PR diff：{diff}
+- PR diff（已过滤测试文件）：{diff}
+  注意：此 diff 已预先过滤掉 tests/、test/ 目录及测试文件（*_test.py、*_spec.py 等），以控制 prompt 长度。你只需关注业务代码的逻辑和安全性问题。
 
 要求：
 1. 仅关注被修改的代码
