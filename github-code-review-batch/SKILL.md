@@ -1,0 +1,1337 @@
+---
+name: github-code-review-batch
+description: |
+  GitHub Pull Request 批量/调度代码审查工具（非监听模式）。
+  复刻 Claude Code 官方 code-review 插件工作流，使用多 Agent 并行审查 PR 变更，
+  通过 issue 验证机制过滤误报，支持 CLAUDE.md 和 AGENTS.md 双重规范检查。
+  使用 gh CLI 发布 PR 评论，无需额外 MCP 配置。
+  
+  与监听模式不同，本 Skill 为一次性短会话：执行审查 → 发布评论 → 输出状态报告 → 立即结束。
+  状态完全通过 PR 评论中的 metadata 持久化，供外部调度器（如 zima daemon）交替调度 CR agent 和 fix agent。
+  
+  触发词: "batch review pr", "review pr batch", "scheduled review pr"
+---
+
+# GitHub Code Review Batch Skill
+
+GitHub Pull Request 批量/调度代码审查工具（**非监听模式**）。复刻 Claude Code 官方 code-review 插件工作流，使用多 Agent 并行审查 PR 变更，通过 issue 验证机制过滤误报，支持 CLAUDE.md 和 AGENTS.md 双重规范检查。使用 gh CLI 发布 PR 评论，无需额外 MCP 配置。
+
+**与监听模式的区别**：
+- 本 Skill 每次调用都是独立的短会话，执行完立即结束，不启动 background watcher
+- 状态通过 PR 评论中的 HTML metadata 持久化，供下次调用时恢复
+- 适用于外部调度器（如 zima daemon）交替调度 CR agent 和 fix agent 的场景
+- 每次结束输出机器可读的状态报告，供调度器决策是否继续调度 fix agent
+
+## 使用方式
+
+在任意 Git 仓库中，使用以下方式触发审查：
+
+```
+batch review pr
+review pr batch
+scheduled review pr
+```
+
+可以带 PR 编号：
+
+```
+batch review pr #123
+review pr batch 456
+scheduled review pr owner/repo#101
+```
+
+如果不提供 PR 编号，默认使用当前分支关联的 PR。通过 `Shell` 执行 `gh pr view --json number` 获取当前分支关联的 PR 编号。如果当前分支没有关联的 PR，则提示用户明确提供 PR 编号。
+
+提取 PR 编号的规则：
+- 支持 `#123` 格式
+- 支持直接数字如 `456`
+- 支持 `owner/repo#123` 格式
+- 如果用户没有提供，使用当前分支关联 PR
+
+## 前置要求
+
+1. **GitHub CLI (gh)** 已安装并认证：
+   ```bash
+   gh --version
+   gh auth status
+   ```
+   如未认证，运行 `gh auth login` 完成认证。认证时需要确保有该仓库的读取和评论权限。
+
+2. 当前目录在 Git 仓库中，且有 GitHub remote。可以通过 `git remote -v` 验证。
+
+3. 用户对本仓库有读取 PR 和在 PR 下发表评论的权限。
+
+## 执行流程
+
+### Step 0: 审查类型判断
+
+本 Skill 为**非监听模式**，每次调用都是独立的短会话。状态完全通过 PR 评论中的 metadata 持久化。在正式审查之前，判断本次审查的类型：首次完整审查，还是基于前一轮 metadata 的增量审查。
+
+#### 0.1 检测 previous review metadata
+
+使用 `Shell` 执行：
+```bash
+gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+```
+
+筛选 Kimi Code CLI 发布的 review 评论：
+1. 评论 body 包含 `"Generated with Kimi Code CLI"`
+2. 评论 body 包含 `"<!-- kimi-cr-meta"`
+
+按 `submitted_at` 排序，取最新一条。使用正则表达式提取 HTML Comment 中的 JSON metadata：
+```
+<!-- kimi-cr-meta\n(.*?)\n-->
+```
+
+解析 metadata 字段：`round`, `head_sha`, `previous_head_sha`, `issues`。
+
+#### 0.2a 读取并解析 committer 回应
+
+对于增量审查，在提取 previous_issues 后，需要读取 committer 对上一轮 issues 的回应，避免重复标记已解释/已拒绝修复的问题。
+
+**执行步骤：**
+
+1. 使用 `Shell` 执行 `gh pr view <PR> --comments` 获取所有 PR 评论
+2. 过滤掉 Kimi CR 评论（body 包含 `"Generated with Kimi Code CLI"`），保留 committer / human reviewer 的评论
+3. 对每个 `status="open"` 的 previous issue，检查 committer 评论中是否提及该 issue：
+   - 匹配方式：issue 描述前 10 个单词、或 `file:lines` 组合、或 `"issue-{id}"` 引用
+4. **分类 committer 回应**（关键词匹配，不区分大小写）：
+
+| 信号关键词 | 分类 (`resolution`) | 处理方式 |
+|-----------|---------------------|---------|
+| "wontfix", "won't fix", "by design", "intentional", "not a bug", "不需要修复", "不修复", "设计如此" | `wontfix` | 标记为 acknowledged，不列入 "Still open" |
+| "fixed", "已修复", "done", "resolved", "addressed" | `resolved` | 标记 `status="resolved"`（delta-reviewer 再验证） |
+| "clarify", "说明", "actually", "context:", "returns", "只返回", "strictly" | `clarified` | 添加 `committer_note`，传递给 delta-reviewer |
+| 无明确信号 | `null` | 无变化，按原有流程处理 |
+
+5. 当分类为 `wontfix` 或 `clarified` 时，在对应 issue 上增加字段：
+   - `resolution`: `"acknowledged"` / `"wontfix"` / `"resolved"` / `null`
+   - `committer_note`: committer 评论中的相关原文片段
+
+**注意**：分类是启发式的。不确定时，优先分类为 `clarified` 而非 `wontfix`，以保留人工判断空间。
+
+#### 0.3 判断分支
+
+**有 previous review metadata？**
+- 是 → 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取当前 head SHA
+  - 当前 SHA == `previous_head_sha` → **无新 commit**
+    - 输出：`"No new commits since Round-{round} review. Previous issues may still be open."`
+    - 列出仍 open 的 issues（排除已标记 `resolution="acknowledged"` / `"wontfix"` 的）
+    - 输出【状态报告】（见 Step 10）
+    - 结束
+  - 当前 SHA != `previous_head_sha` → **有新 commit**
+    - 标记当前为 `Round = round + 1`
+    - 提取 `previous_issues = issues`
+    - **执行 Step 0.2a**：读取并解析 committer 对上一轮 issues 的回应，更新 `previous_issues` 的 `resolution` 和 `committer_note` 字段
+    - 进入【增量审查流程】，跳过 Step 1-9
+- 否 → 首次审查 → 走完整流程（Round = 1）
+
+#### 0.4 异常情况
+
+- Metadata 提取失败（格式损坏或正则不匹配）→ 输出警告，fallback 到完整流程
+- `gh pr view --json reviews` 失败 → 视为无 previous review，继续正常流程
+
+### Step 1: PR 资格审查
+
+使用 `Shell` 执行 `gh pr view <PR>` 和 `gh pr view <PR> --comments` 检查 PR 状态。
+
+检查以下任一条件：
+- PR 是否已关闭 (state: CLOSED)
+- PR 是否为草稿 (isDraft: true)
+- PR 是否是 trivial PR（如 dependabot、renovate、纯格式化、仅修改配置文件）
+- PR 是否是自动化 PR（PR 标题或描述包含 "automated"、"bot" 等标识）
+
+如果上述任一条件为真，立即停止执行，向用户说明原因，不继续审查。
+
+**注意**：与监听模式不同，非监听模式下**不检查**"是否已有 bot 评论"。因为本 Skill 依赖外部调度器交替调度，同一 PR 会被多次审查（首次 → 增量 → 增量...），这是预期行为。Step 0 会通过 metadata 和 SHA 对比自动判断是首次审查还是增量审查。
+
+重要例外：即使 PR 是 Claude 或 Kimi 生成的，仍然进行审查。Claude/Kimi 生成的 PR 也可能存在规范违规或逻辑错误，因此不跳过。
+
+如何判断 trivial PR：
+- 标题包含 "bump"、"update"、"dependabot"、"renovate"、"format"、"lint"
+- 只修改了配置文件（如 `.github/workflows`、`.prettierrc`、锁文件）
+- 变更行数极少且明显无意义
+
+### Step 2: 收集项目规范
+
+使用 `Shell` 执行 `gh pr diff <PR> --name-only` 获取变更文件列表。
+
+根据变更文件路径，读取以下规范文件（使用 `ReadFile` 工具）：
+- 根目录的 `CLAUDE.md`
+- 根目录的 `AGENTS.md`
+- 变更文件所在子目录的 `CLAUDE.md`
+- 变更文件所在子目录的 `AGENTS.md`
+
+例如，如果变更文件为 `src/utils/helpers.py`，则需要检查：
+- `./CLAUDE.md`
+- `./AGENTS.md`
+- `./src/CLAUDE.md`
+- `./src/AGENTS.md`
+- `./src/utils/CLAUDE.md`
+- `./src/utils/AGENTS.md`
+
+将读取到的规范文件内容汇总为一个规范上下文字符串，供后续审查 Agent 使用。如果某目录下没有规范文件，则跳过。
+
+注意：子目录的规范文件优先于父目录。如果存在冲突，以最深目录的规范为准。
+
+### Step 3: 获取 PR 摘要
+
+使用 `Shell` 执行以下命令：
+- `gh pr view <PR>` 获取 PR 标题和描述
+- `gh pr diff <PR>` 获取完整 diff
+
+使用 `Agent` 启动 summarizer subagent，输入包括：
+- PR 标题
+- PR 描述
+- PR diff 内容
+
+summarizer 输出一段简洁的变更摘要（不超过 300 字），帮助后续审查 Agent 快速理解变更意图。
+
+### Step 3.5: Diff 预处理（防 prompt 过长）
+
+在将 diff 传入 sub-agent 之前，进行预处理和长度保护，避免完整 diff 直接嵌入 prompt 导致 JSON 解析失败（参见 issue #4）。
+
+**预处理规则**：
+
+1. **按 agent 类型过滤 diff**：
+   - CLAUDE.md checker ×2、AGENTS.md checker：接收**完整 diff**（规范检查需要完整上下文）
+   - Bug scanner、Logic analyzer：接收**过滤后的 diff**，排除以下测试相关文件：
+     - `tests/`、`test/` 目录下的文件
+     - `*_test.py`、`*_spec.py`、`*_tests.py` 等测试文件
+     - `.test.`、`.spec.` 等测试文件
+
+2. **长度硬限制**（兜底保护，适用于所有 agent）：
+   ```
+   MAX_PROMPT_DIFF_LEN = 4000  # 字符
+
+   if len(filtered_diff) > MAX_PROMPT_DIFF_LEN:
+       # 保留变更 hunk（+/- 行）及前后各 2 行上下文，去掉完整的未变更函数体
+       filtered_diff = keep_hunks_only(filtered_diff, context_lines=2)
+
+   if len(filtered_diff) > MAX_PROMPT_DIFF_LEN:
+       # 二次截断：截断至 4000 字符并在末尾添加提示
+       filtered_diff = filtered_diff[:4000] + "\n... (diff truncated due to length)"
+   ```
+
+3. **效果验证**：过滤后的 diff 长度通常减少 **60-70%**（测试文件往往占据大比例 diff）。
+
+### Step 4: 5 个并行审查 Agent
+
+启动 5 个并行 `Agent`，每个接收经过 Step 3.5 预处理的输入包：
+- **CLAUDE.md checker ×2、AGENTS.md checker**：完整 diff（或截断后的）+ 变更摘要 + PR 标题和描述 + 相关规范文件内容
+- **Bug scanner、Logic analyzer**：过滤掉测试文件的 diff（或截断后的）+ 变更摘要 + PR 标题和描述
+
+**Agent 1: CLAUDE.md compliance checker**
+- 检查变更是否违反 `CLAUDE.md` 中的规则
+- 尽量引用规则原文；对于逻辑/安全问题，无需强制引用规范
+- 仅关注 PR 修改的内容，不评论原有代码
+- 输出 JSON 格式问题列表
+
+**Agent 2: CLAUDE.md compliance checker (redundant)**
+- 与 Agent 1 相同任务，独立运行
+- 用于交叉验证，减少漏检和误报
+- 两个独立的 checker 可以提高规范检查的召回率和准确率
+
+**Agent 3: AGENTS.md compliance checker**
+- 检查变更是否违反 `AGENTS.md` 中的规则
+- 尽量引用规则原文；对于逻辑/安全问题，无需强制引用规范
+- 注意区分适用于代码审查的规则 vs 仅适用于编码行为的规则
+- 仅关注 PR 修改的内容
+
+**Agent 4: Bug scanner**
+- 基于 diff 内容扫描 Bug 和潜在问题
+- 不读取额外上下文文件，避免引入外部噪音
+- 关注：编译/解析错误、缺失导入、未解析引用、逻辑错误、空值处理、竞态条件、边界条件
+- 忽略纯风格问题，但关注可能导致运行时错误的设计问题
+
+**Agent 5: Logic / security analyzer**
+- 分析变更代码的逻辑正确性和安全性
+- 仅关注被修改的代码
+- 关注：资源泄漏、错误处理缺失、安全漏洞、竞态条件、边界条件、异常路径
+- 对于依赖输入的潜在问题，如果代码没有做任何防御性处理，仍然值得报告
+
+每个 Agent 输出 JSON 格式的问题列表：
+```json
+[
+  {
+    "description": "问题描述",
+    "reason": "问题原因类别",
+    "file": "文件路径",
+    "lines": "行号范围",
+    "suggestion": "修复建议"
+  }
+]
+```
+
+如果未发现任何问题，输出空列表 `[]`。
+
+JSON 字段说明：
+- `description`: 简洁描述问题，1-2 句话
+- `reason`: 问题类别，如 "CLAUDE.md"、"AGENTS.md"、"bug"、"logic"
+- `file`: 相对于仓库根目录的文件路径
+- `lines`: 行号范围，格式如 "45-52"
+- `suggestion`: 可选的修复建议
+
+### Step 5: Issue 验证
+
+对 Step 4 中发现的每一个 issue，启动一个并行 `Agent` 进行验证。
+
+验证 agent 输入：
+- 单个 issue 的完整信息
+- PR diff
+- 相关规范文件内容
+
+验证 agent 执行以下检查：
+1. 该 issue 描述的问题是否真实存在于代码中？（如果是误读代码导致的明显错误，标记 invalid）
+2. 对于规范类 issue（reason 包含 CLAUDE.md 或 AGENTS.md）：规则是否在规范文件中被表述，且适用于当前变更？（规则不必一字不差地原文引用，大意匹配即可）
+3. 对于 bug 类 issue（reason 包含 bug 或 logic）：代码逻辑是否确实有问题？是否是 PR 引入的或 PR 未修复的？（不要因为是"潜在问题"就过滤掉，除非它完全是假设性的）
+4. 只有当 issue 明显是误读代码、或问题在变更前就已存在且 PR 并未触及、或规则引用完全不相关时，才标记 `valid: false`
+
+验证 agent 输出 JSON：
+```json
+{
+  "valid": true,
+  "explanation": "验证说明"
+}
+```
+
+或：
+```json
+{
+  "valid": false,
+  "explanation": "该问题不存在，因为..."
+}
+```
+
+只有 `valid: true` 的 issue 才会进入下一步。`valid: false` 的 issue 被直接丢弃。
+
+issue 验证用于评估审查 agent 发现的问题。验证 agent 的职责是确认问题不是明显的误读，并补充说明问题的严重程度。不要过度过滤——宁可保留一个值得讨论的问题，也不要漏掉一个真实缺陷。
+
+### Step 6: 过滤与汇总
+
+对通过验证的 issue 进行后处理：
+
+1. **丢弃无效 issue**：移除所有 `valid: false` 的 issue
+2. **去重**：如果多个 issue 的 `file`、`lines`、`reason` 相同或高度相似，合并为一个
+3. **排序优先级**：
+   - 1. CLAUDE.md 合规问题
+   - 2. AGENTS.md 合规问题
+   - 3. bug 问题
+   - 4. logic / security 问题
+
+去重规则：
+- 如果两个 issue 指向同一个文件、同一行范围、且原因相同，视为重复
+- 如果描述内容高度相似（超过 80% 相似度），也视为重复
+- 合并时保留描述更详细、建议更具体的一个
+
+### Step 7: 最终资格审查
+
+使用 `Shell` 执行 `gh pr view <PR> --json state` 再次检查 PR 状态。
+
+如果 PR 已关闭 (closed) 或已合并 (merged)，立即停止执行，不发布评论。这是为了防止在审查过程中 PR 状态发生变化，避免对已关闭的 PR 发布无意义的评论。
+
+最终资格审查是必要的，因为整个审查流程（特别是并行 Agent 执行）可能需要数分钟时间，在此期间 PR 状态可能发生变化。
+
+### Step 8: 终端输出
+
+输出 Markdown 格式的审查报告到终端。
+
+如果发现问题的格式：
+```markdown
+### Code Review
+
+Found N issues:
+
+1. {description} ({reason})
+
+https://github.com/owner/repo/blob/{full-sha}/{file}#L{start}-L{end}
+
+2. {description} ({reason})
+
+https://github.com/owner/repo/blob/{full-sha}/{file}#L{start}-L{end}
+```
+
+如果没有问题的格式：
+```markdown
+### Code Review
+
+No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
+```
+
+代码链接格式要求：
+- 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取 PR head SHA（40 字符）
+- 链接格式必须严格为：`https://github.com/owner/repo/blob/[sha]/path#L[start]-L[end]`
+- 行范围至少包含 1 行上下文（评论目标行的前后至少各 1 行）
+- 从 `gh pr diff` 中提取准确的行号信息
+- 仓库 owner 和 repo 名可通过 `gh pr view --json headRepositoryOwner,headRepository` 获取
+
+行号提取方法：
+- 在 diff 中，新增内容以 `+` 开头，对应的行号在 diff hunk 头部标明
+- 例如 `@@ -45,7 +67,9 @@` 表示旧文件从第 45 行开始，新文件从第 67 行开始
+- 计算目标代码在新文件中的实际行号
+
+### Step 9: 构建并发布 PR Review 评论（必须）
+
+此步骤构建包含 metadata 的结构化 review 评论，并发布到 PR。
+
+#### 9.1 构建评论 Body
+
+评论由两部分组成：
+
+**Part A: HTML Comment Metadata（机器可读，GitHub 渲染时隐藏）**
+
+在评论 body 最开头插入：
+```markdown
+<!-- kimi-cr-meta
+{"round":{round},"pr_number":{pr_number},"head_sha":"{head_sha}","previous_head_sha":"{previous_head_sha}","total_issues":{total},"resolved_count":{resolved},"new_count":{new},"issues":[{issues_json}],"timestamp":"{iso_timestamp}"}
+-->
+```
+
+Metadata 字段：
+- `round`: 当前轮次（首次审查为 1，增量审查为 N+1）
+- `pr_number`: PR 编号
+- `head_sha`: 当前 PR head commit 的完整 SHA（40 字符）
+- `previous_head_sha`: 上一轮 review 时的 head SHA（Round-1 为 null）
+- `total_issues`: 当前轮次统计的问题总数（不含 acknowledged）
+- `resolved_count`: 本轮标记为 resolved 的问题数（Round-1 为 0）
+- `new_count`: 本轮新发现的问题数
+- `acknowledged_count`: 本轮标记为 acknowledged / wontfix 的问题数
+- `issues`: 问题数组，每个元素含：
+  - `status`（"open" 或 "resolved"）
+  - `resolution`（"acknowledged" / "wontfix" / "resolved" / null）
+  - `committer_note`（string 或 null）
+- `timestamp`: ISO 8601 格式时间戳
+
+**Part B: Markdown 人类可读部分**
+
+Round-1 格式：
+```markdown
+### Code Review | Round-1
+
+Found {N} issues:
+
+1. {description} ({reason})
+
+   https://github.com/owner/repo/blob/{sha}/{file}#L{start}-L{end}
+
+🤖 Generated with Kimi Code CLI
+```
+
+Round-N（N ≥ 2，增量审查）格式：
+```markdown
+### Code Review | Round-{N} (Re-check)
+
+Previous Round-{N-1} issues: {M}
+- **Resolved**: {R} ({resolved_issue_descriptions})
+- **Acknowledged / Won't Fix**: {A} ({acknowledged_issue_descriptions})
+- **Still open**: {M - R - A}
+
+New issues found: {new_count}
+
+#### Acknowledged / Won't Fix
+
+{acknowledged_issue_list}
+
+#### Still Open from Previous Rounds
+
+{remaining_issue_list}
+
+#### New Issues
+
+{new_issue_list}
+
+🤖 Generated with Kimi Code CLI
+```
+
+说明：
+- 如果 `acknowledged_issues` 为空，省略 "Acknowledged / Won't Fix" 小节及其标题
+- Acknowledged issues 不计入 "Still open" 数量
+- Acknowledged issues 不会触发外部 fix agent 调度（调度器只关注真正 open 的 issues）
+
+All issues resolved 格式：
+```markdown
+### Code Review | Round-{N} (Re-check)
+
+Previous Round-{N-1} issues: {M}
+- **Resolved**: {M}
+- **Still open**: 0
+
+New issues found: 0
+
+✅ **All issues resolved!**
+
+🤖 Generated with Kimi Code CLI
+```
+
+#### 9.2 发布 Review 评论
+
+使用 `Shell` 执行：
+```bash
+# 将 review body 写入临时文件（避免 shell 转义和长命令问题）
+echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
+gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
+```
+
+注意：
+- 每轮审查都发布**新评论**，不编辑旧评论
+- `<review_body>` 必须包含 HTML Comment metadata + Markdown 人类可读部分
+- 必须包含 `"🤖 Generated with Kimi Code CLI"` 标识，用于后续识别
+- 必须包含 `"### Code Review | Round-{N}"` 标题
+- 此步骤必须执行。只要有资格审查通过，无论是否发现问题，都必须发布评论
+- 如果 `gh pr review` 命令失败，向用户报告错误详情，不重复尝试
+
+### Step 10: 状态报告输出（必须）
+
+每次审查结束时，无论发现问题与否，都必须输出状态报告到终端。状态报告是供外部调度器（如 zima daemon）和 fix agent 消费的机器可读摘要。
+
+#### 输出时机
+
+以下情况均须输出状态报告：
+- Step 0 检测到无新 commit → 输出当前 open issues 状态
+- Step 6 过滤后存在 open issues → 输出问题统计
+- Step 6 过滤后无 open issues → 输出 "All issues resolved"
+- PR 在 Step 7 被判定为已关闭/已合并 → 已在 Step 7 停止，不输出状态报告
+
+#### 状态报告格式
+
+```markdown
+=== CR Batch Status Report ===
+PR: #{pr_number} | Round: {round} | Head SHA: {head_sha}
+Previous Head SHA: {previous_head_sha}
+Total open issues: {open_count}
+- New this round: {new_count}
+- Still open from previous: {unresolved_count}
+- Resolved this round: {resolved_count}
+- Acknowledged / Won't Fix: {acknowledged_count}
+Status: {status}
+================================
+```
+
+字段说明：
+- `PR`: PR 编号
+- `Round`: 当前审查轮次
+- `Head SHA`: 当前 PR head commit 的完整 SHA（40 字符）
+- `Previous Head SHA`: 上一轮 review 时的 head SHA（Round-1 为 `null`）
+- `Total open issues`: 当前仍 open 的问题总数（不含 acknowledged）
+- `New this round`: 本轮新发现的问题数
+- `Still open from previous`: 从前几轮遗留仍未解决的问题数
+- `Resolved this round`: 本轮标记为已修复的问题数（增量审查时）
+- `Acknowledged / Won't Fix`: 被 committer 明确拒绝修复的问题数
+- `Status`: 
+  - `NEEDS_FIX` — 仍有 open issues 需要修复
+  - `PASS` — 无 open issues（可能仍有 acknowledged）
+  - `NO_NEW_COMMITS` — Step 0 检测到无新 commit
+
+#### 用途
+
+- **zima 调度器**：根据 `Status` 决策是否调度 fix agent
+  - `NEEDS_FIX` → 调度 fix agent 修复 open issues
+  - `PASS` → 当前 PR 无需进一步 action
+  - `NO_NEW_COMMITS` → 本轮跳过，等待下次调度
+- **fix agent**：快速获取当前 open issues 列表，无需重新解析 metadata
+- **人工查看**：一目了然了解当前审查状态
+
+## 审查覆盖原则
+
+### 优先标记以下问题（高优先级）
+
+- **编译/解析错误**：语法错误、无法通过编译的代码
+- **缺失导入**：使用了未导入的模块、函数、类
+- **未解析引用**：引用了不存在的变量、函数、属性
+- **确定性逻辑错误**：代码逻辑明显错误，不依赖外部输入即可判定
+- **规范违规**：`CLAUDE.md` 或 `AGENTS.md` 中的规则违反（尽量引用规则原文；对于逻辑/安全问题，无需强制引用规范）
+- **资源泄漏与安全漏洞**：未关闭的文件句柄、未释放的连接、明显的注入风险、竞态条件
+
+### 同样值得关注的问题（中优先级）
+
+- **错误处理缺失**：关键路径缺少异常处理、错误码被静默吞掉
+- **边界条件问题**：空值、空列表、零除等未处理的边界情况
+- **文档与代码不一致**：PR 描述或文档声称做了某事，但代码实际未做到（如声称更新了某文件但 diff 中不存在）
+- **潜在的逻辑缺陷**：条件判断明显不合理、循环/递归终止条件有问题
+
+### 不标记以下问题
+
+- **代码风格问题**：缩进、命名风格、括号位置等纯格式问题
+- **一般代码质量问题**：函数过长、圈复杂度高等（除非导致明确错误）
+- **主观性建议**："这里可以优化..."、"建议换一种写法..." 等没有明确对错的意见
+- **PR 未修改的原有代码中的问题**：只审查变更内容
+- **Linter / TypeChecker 可以捕获的问题**：如果静态分析工具已经能发现，不重复报告
+- **已被 lint-ignore 注释忽略的规则**：代码中明确有 `eslint-disable`、`type: ignore` 等注释的，尊重开发者意图
+
+## 边界情况处理
+
+| 情况 | 处理方式 |
+|------|----------|
+| PR 已关闭/已合并 | Step 1 或 Step 7 捕获，停止执行并向用户说明 |
+| PR 是草稿 | Step 1 捕获，停止执行并向用户说明 |
+| PR 是 trivial/自动化 | Step 1 捕获，停止执行并向用户说明 |
+| 已有 bot 评论 | Step 1 捕获，停止执行并向用户说明，避免重复审查 |
+| PR 由 Claude/Kimi 生成 | 正常审查，不跳过 |
+| 无 CLAUDE.md / AGENTS.md | 仅执行 bug scanner 和 logic analyzer |
+| 大 PR（超过 50 个文件） | 正常处理，并行 Agent 保证效率 |
+| 所有 issue 验证为无效 | 输出 "No issues found" |
+| 审查过程中 PR 关闭 | Step 7 捕获，不发布评论 |
+| `gh` 命令失败 | 向用户报告错误详情，停止执行 |
+| 当前分支无关联 PR | 提示用户提供 PR 编号 |
+| 提取不到完整 SHA | 使用 `gh pr view <PR> --json headRefOid` 获取 head SHA，失败则报错 |
+| Agent 返回格式错误的 JSON | 尝试解析，失败则忽略该 Agent 的输出 |
+| diff 过大无法完整处理 | Step 3.5 预处理：过滤测试文件 + 4000 字符硬限制（hunk-only 压缩 + 截断），不再丢弃整个分析 |
+| 无新 commit（调度器轮询） | Step 0 检测 → 输出状态报告（含仍 open 的 issues），Status: NO_NEW_COMMITS |
+| Metadata 提取失败 | Fallback 到完整流程，输出 "Previous review metadata corrupted" |
+| Round 编号溢出（>99） | 继续递增，无上限 |
+| committer 评论中无明确信号 | 分类为 null，按原有流程处理 |
+| committer 回应与代码实际不符 | delta-reviewer 结合 diff 判断，以代码为准 |
+| 所有 open issues 被标记 acknowledged | 输出状态报告，Status: PASS（无真正 open issues） |
+
+## SubAgent 详细定义
+
+### summarizer
+
+**输入**: PR 标题、PR 描述、PR diff
+**输出**: 一段简洁的变更摘要（不超过 300 字）
+
+**任务**:
+1. 阅读 PR 标题和描述，理解变更的意图和背景
+2. 阅读 diff 内容，识别主要修改点
+3. 忽略纯格式化和配置变更的细节
+4. 输出简洁摘要，突出关键的功能变更、架构调整或重要修复
+
+### claude-compliance-checker
+
+**输入**: PR diff、PR 摘要、相关 CLAUDE.md 文件内容
+**输出**: JSON 问题列表 `[{description, reason, file, lines, suggestion}]`
+
+**任务**:
+1. 阅读所有相关 CLAUDE.md 文件
+2. 识别文件中陈述的规则和要求
+3. 检查 PR 变更是否违反这些规则
+4. 尽量引用规则原文，但不要求一字不差；对于逻辑/安全问题，无需强制引用规范
+5. 仅关注 PR 修改的内容，忽略原有代码
+6. 如果没有发现违规，返回空列表
+7. 不报告纯主观判断，但值得关注的逻辑缺陷和安全问题应当报告
+
+reason 字段应包含 "CLAUDE.md"。
+
+### agents-compliance-checker
+
+**输入**: PR diff、PR 摘要、相关 AGENTS.md 文件内容
+**输出**: JSON 问题列表 `[{description, reason, file, lines, suggestion}]`
+
+**任务**:
+1. 阅读所有相关 AGENTS.md 文件
+2. 识别文件中陈述的规则和要求
+3. 区分适用于代码审查的规则 vs 仅适用于编码行为的规则
+4. 检查 PR 变更是否违反适用于审查的规则
+5. 尽量引用规则原文，但不要求一字不差；对于逻辑/安全问题，无需强制引用规范
+6. 仅关注 PR 修改的内容，忽略原有代码
+7. 如果没有发现违规，返回空列表
+
+reason 字段应包含 "AGENTS.md"。
+
+### bug-scanner
+
+**输入**: PR diff
+**输出**: JSON 问题列表 `[{description, reason, file, lines, suggestion}]`
+
+**任务**:
+1. 仅关注变更本身，不读取额外上下文文件
+2. 扫描明显的逻辑错误、空值处理、竞态条件、边界条件、缺失导入、未解析引用
+3. 关注所有可能导致运行时错误的 Bug，不要忽略"看起来可能是误报"的问题
+4. 对于不确定的问题仍然报告，在 description 中用 "Potential:" 或 "Possible:" 标注
+5. 返回发现的问题列表，无问题返回空列表
+
+reason 字段应为 "bug"。
+
+### logic-analyzer
+
+**输入**: PR diff、PR 摘要
+**输出**: JSON 问题列表 `[{description, reason, file, lines, suggestion}]`
+
+**任务**:
+1. 分析变更代码的逻辑正确性和安全性
+2. 仅关注被修改的代码
+3. 关注资源泄漏、错误处理缺失、安全漏洞、竞态条件、边界条件、异常路径
+4. 对于依赖输入的潜在问题，如果代码没有做任何防御性处理，仍然值得报告
+5. 忽略纯风格问题和无明确对错的主观建议
+6. 返回发现的问题列表，无问题返回空列表
+
+reason 字段应为 "logic" 或 "security"。
+
+### issue-validator
+
+**输入**: 单个 issue、PR diff、相关规范文件内容
+**输出**: JSON `{valid: boolean, explanation: string}`
+
+**任务**:
+1. 重新审查 issue 对应的目标代码
+2. 判断问题是否真实存在于代码中（只有明显误读代码才标记 invalid）
+3. 对于规范类 issue：检查规则是否在规范文件中被表述，且适用于当前变更（规则不必一字不差引用）
+4. 对于 bug 类 issue：检查代码逻辑是否确实有问题，是否是 PR 引入的或 PR 未修复的（不要因为不够"确定性"就过滤掉）
+5. 只有当 issue 明显是误读代码、或问题在变更前就已存在且 PR 并未触及、或规则引用完全不相关时，才标记 `valid: false`
+6. 返回验证结果和解释
+
+### delta-reviewer
+
+**输入**: PR 完整 diff、previous_issues 列表（含 `resolution` 和 `committer_note` 字段）、previous_head_sha、current_head_sha、相关规范文件
+**输出**: JSON `{resolved_issues, acknowledged_issues, new_issues, unresolved_issues, pass}`
+
+**任务**:
+1. 处理带 committer 回应的 previous issues：
+   - `resolution="acknowledged"` / `"wontfix"` → 加入 `acknowledged_issues`，不再视为 open
+   - `resolution="clarified"`（有 `committer_note`）→ 结合澄清内容判断 issue 是否仍有效。如果澄清使 issue 失效，标记为 resolved 并引用澄清；否则加入 `unresolved_issues`
+   - `resolution=null` → 进入下一步 diff 对比
+2. 对比 `previous_issues` 和当前 diff：
+   - 遍历每个 previous issue（无 resolution 或 resolution=null），检查其 `file` + `lines` 范围是否在 diff 中被修改
+   - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 `resolved_issues`
+   - 未修改 → 加入 `unresolved_issues`
+3. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 `new_issues`
+   - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
+   - 仔细审查修复代码本身的正确性
+4. 对于规范类问题，检查 CLAUDE.md / AGENTS.md 中相关规则是否仍适用
+
+**输出 JSON 格式**:
+```json
+{
+  "resolved_issues": [
+    {
+      "original_id": "issue-1",
+      "description": "Missing error handling for OAuth callback",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "67-72",
+      "resolution_note": "Error handling added in new commit"
+    }
+  ],
+  "acknowledged_issues": [
+    {
+      "original_id": "issue-2",
+      "description": "/shutdown endpoint lacks authentication",
+      "reason": "logic",
+      "file": "src/server.py",
+      "lines": "45-50",
+      "committer_note": "daemon binds to localhost only, authentication not needed for local service"
+    }
+  ],
+  "new_issues": [
+    {
+      "id": "issue-4",
+      "description": "New race condition in callback",
+      "reason": "logic",
+      "file": "src/auth.ts",
+      "lines": "100-105",
+      "suggestion": "Add mutex lock"
+    }
+  ],
+  "unresolved_issues": [
+    {
+      "original_id": "issue-3",
+      "description": "Memory leak: OAuth state not cleaned up",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "88-95"
+    }
+  ],
+  "pass": false
+}
+```
+
+**约束**:
+- 只关注被修改的代码，不评论原有代码
+- 对于已修复的问题，必须简要说明修复方式（`resolution_note`）
+- 对于 acknowledged 的问题，保留 `committer_note`
+- 对于未修复的问题，保持原描述不变
+- 新问题使用新的 `id`，不影响原有 issue 编号
+
+## 内部执行模板
+
+当用户触发此 Skill 时，遵循以下精确执行流程：
+
+1. **Step 0: 审查类型判断**
+   - 使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
+   - 筛选含 `"Generated with Kimi Code CLI"` 和 `"<!-- kimi-cr-meta"` 的评论
+   - 提取最新一轮的 JSON metadata
+   - **执行 Step 0.2a**：使用 `gh pr view <PR> --comments` 获取所有评论，解析 committer 回应，更新 previous_issues
+   - 对比 `previous_head_sha` 与当前 `headRefOid`
+   - 无新 commit → 输出状态报告并结束（排除 acknowledged issues）
+   - 有新 commit → 标记 `Round = N + 1`，进入【增量审查流程】
+   - 无 previous review → `Round = 1`，继续下一步
+
+2. **提取 PR 编号**
+   - 从用户输入中提取 PR 号（支持 `#123`、直接数字、或 `owner/repo#123` 格式）
+   - 如果没有提供，使用 `Shell` 执行 `gh pr view --json number` 获取当前分支关联的 PR
+   - 如果当前分支无关联 PR，提示用户提供 PR 编号
+
+3. **Step 1: PR 资格审查**
+   - 使用 `Shell` 执行 `gh pr view <PR>` 获取 PR 状态
+   - 使用 `Shell` 执行 `gh pr view <PR> --comments` 获取评论列表
+   - 检查是否 closed、draft、trivial、automated、已有 bot 评论
+   - 如不符合，返回说明原因并停止
+
+4. **Step 2: 收集项目规范**
+   - 使用 `Shell` 执行 `gh pr diff <PR> --name-only` 获取修改文件列表
+   - 使用 `ReadFile` 读取根目录和变更文件所在目录的 `CLAUDE.md` 和 `AGENTS.md`
+   - 汇总规范文件内容
+
+5. **Step 3: 获取 PR 摘要**
+   - 使用 `Shell` 执行 `gh pr view <PR>` 获取标题和描述
+   - 使用 `Shell` 执行 `gh pr diff <PR>` 获取 diff
+   - 使用 `Agent` 启动 summarizer subagent 总结变更
+
+6. **Step 3.5: Diff 预处理**
+   - 对完整 diff 按 agent 类型进行过滤：
+     - claude-compliance-checker ×2、agents-compliance-checker：保留完整 diff
+     - bug-scanner、logic-analyzer：过滤掉 `tests/`、`test/`、`*_test.py`、`*_spec.py` 等测试相关文件
+   - 对所有过滤后的 diff 应用长度硬限制（`MAX_PROMPT_DIFF_LEN = 4000`）：
+     - 超长时先压缩为 hunk-only（保留 +/- 行及前后各 2 行上下文）
+     - 仍超长则截断至 4000 字符并添加 `... (diff truncated)` 提示
+
+7. **Step 4: 5 个并行审查 Agent**
+   使用 `Agent` 并行启动以下 subagent，传入经过 Step 3.5 预处理的 diff：
+   - claude-compliance-checker（检查 CLAUDE.md 合规性，接收完整或截断后的 diff）
+   - claude-compliance-checker（第二个独立 checker）
+   - agents-compliance-checker（检查 AGENTS.md 合规性）
+   - bug-scanner（扫描 Bug 和潜在问题，接收过滤掉测试文件的 diff）
+   - logic-analyzer（分析逻辑正确性和安全性，接收过滤掉测试文件的 diff）
+
+8. **Step 5: Issue 验证**
+   - 收集所有 Agent 发现的问题
+   - 为每个 issue 使用 `Agent` 并行启动 issue-validator 验证
+   - 收集每个验证结果
+
+9. **Step 6: 过滤与汇总**
+   - 过滤掉 `valid: false` 的 issue
+   - 按 file、lines、reason 去重
+   - 按优先级排序：CLAUDE.md → AGENTS.md → bug → logic
+
+10. **Step 7: 最终资格审查**
+   - 使用 `Shell` 执行 `gh pr view <PR> --json state` 检查 PR 是否仍然开放
+   - 如已关闭或合并，停止并提示用户
+
+11. **Step 8: 终端输出**
+   - 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取完整 SHA
+   - 使用 `Shell` 执行 `gh pr view <PR> --json headRepositoryOwner,headRepository` 获取仓库信息
+   - 格式化 Markdown 报告
+   - 输出到终端
+
+12. **Step 9: 构建并发布 PR Review 评论**
+    - 构建包含 HTML Comment metadata 的结构化评论 body
+    - 使用 `Shell` 执行 `gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md`
+    - 向用户确认完成
+
+13. **Step 10: 状态报告输出（必须）**
+    - 计算统计：open_count、new_count、resolved_count、acknowledged_count、unresolved_count
+    - 格式化状态报告（见 Step 10 定义）
+    - 输出到终端
+    - 进程正常结束
+
+## 增量审查流程
+
+当检测到 PR 有新的 commit（相对于上一轮 review）时，执行增量审查而非完整审查。本流程替代完整流程中的 Step 3-5。
+
+### 适用场景
+
+- Step 0 检测到 previous review metadata 且当前 head SHA != previous_head_sha
+
+### 输入
+
+- `previous_issues`: 从上一轮 metadata 提取的问题列表（含 `id`, `description`, `reason`, `file`, `lines`, `status`, `first_round`）
+- `previous_head_sha`: 上一轮 review 时的 head SHA
+- `current_head_sha`: 当前 PR head SHA
+- PR 完整 diff（`gh pr diff` 输出）
+- 相关规范文件（CLAUDE.md / AGENTS.md）
+
+### 执行步骤
+
+**Step Δ1: 获取完整 diff**
+
+使用 `Shell` 执行 `gh pr diff <PR>` 获取完整 diff。
+
+**Step Δ2: 启动 delta-reviewer Agent**
+
+使用 `Agent` 启动 delta-reviewer（前台，1 个 Agent）：
+
+输入：
+- PR 完整 diff
+- `previous_issues` 列表
+- `previous_head_sha`
+- `current_head_sha`
+- 相关规范文件内容
+
+**Step Δ3: 收集 delta-reviewer 结果**
+
+delta-reviewer 输出 JSON：
+```json
+{
+  "resolved_issues": [
+    {
+      "original_id": "issue-1",
+      "description": "...",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "67-72",
+      "resolution_note": "Error handling added in new commit"
+    }
+  ],
+  "new_issues": [
+    {
+      "id": "issue-4",
+      "description": "...",
+      "reason": "logic",
+      "file": "src/auth.ts",
+      "lines": "100-105",
+      "suggestion": "..."
+    }
+  ],
+  "unresolved_issues": [
+    {
+      "original_id": "issue-3",
+      "description": "...",
+      "reason": "bug",
+      "file": "src/auth.ts",
+      "lines": "88-95"
+    }
+  ],
+  "pass": false
+}
+```
+
+**Step Δ4: 汇总问题列表**
+
+构建当前轮次的完整 issues 列表：
+- `resolved_issues` → 保留原 `id`，标记 `status="resolved"`，`resolution="resolved"`
+- `acknowledged_issues` → 保留原 `id`，标记 `status="open"`，`resolution="acknowledged"`，保留 `committer_note`
+- `unresolved_issues` → 保留原 `id`，标记 `status="open"`，`resolution=null`
+- `new_issues` → 生成新 `id`（如 `"issue-{max_id+1}"`），标记 `status="open"`，`first_round = current_round`
+
+**Step Δ5: 继续至 Step 6（过滤与汇总）**
+
+将汇总后的问题列表传入 Step 6，继续执行 Step 6-9-10 的标准流程。
+
+注意：Step 10 输出状态报告时，`Status` 为 `PASS` 的条件是不存在 `status="open"` 且 `resolution != "acknowledged"` 的 issues。
+
+### 与完整流程的区别
+
+| 步骤 | 完整流程 | 增量流程 |
+|------|---------|---------|
+| Step 3 | summarizer + 5 个审查 Agent | delta-reviewer 1 个 Agent |
+| Step 4 | 5 个并行审查 Agent | 由 delta-reviewer 替代 |
+| Step 5 | 每个 issue 单独验证 | 由 delta-reviewer 内部完成对比验证 |
+| 输出 | 全新问题列表 | resolved + new + unresolved 分类 |
+
+## gh 命令参考
+
+本 Skill 使用以下 `gh` 命令：
+
+```bash
+# 获取当前分支关联的 PR 编号
+gh pr view --json number
+
+# 获取 PR 详情
+gh pr view <PR>
+
+# 获取 PR 评论
+gh pr view <PR> --comments
+
+# 获取 PR 状态
+gh pr view <PR> --json state
+
+# 获取变更文件列表
+gh pr diff <PR> --name-only
+
+# 获取完整 diff
+gh pr diff <PR>
+
+# 获取仓库信息
+gh pr view <PR> --json headRepositoryOwner,headRepository
+
+# 发布 PR 评论
+echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
+gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
+
+# 获取 PR review 评论列表（含 review body 和提交时间）
+gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+
+# 获取 PR head commit SHA（用于对比是否有新 commit）
+gh pr view <PR> --json headRefOid --jq '.headRefOid'
+
+# 获取 PR reviewDecision（APPROVED / CHANGES_REQUESTED / PENDING）
+gh pr view <PR> --json reviewDecision
+
+# 获取 PR commits 列表
+gh api repos/{owner}/{repo}/pulls/{number}/commits
+```
+
+## 示例输出
+
+### Round-1 发现问题时的输出
+
+```markdown
+<!-- kimi-cr-meta
+{"round":1,"pr_number":123,"head_sha":"abc123def4567890123456789012345678901234","previous_head_sha":null,"total_issues":3,"resolved_count":0,"new_count":3,"issues":[{"id":"issue-1","description":"Missing error handling for OAuth callback","reason":"bug","file":"src/auth.ts","lines":"67-72","status":"open","first_round":1},{"id":"issue-2","description":"Inconsistent naming pattern","reason":"AGENTS.md","file":"src/utils.ts","lines":"23-28","status":"open","first_round":1},{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1}],"timestamp":"2026-04-21T10:00:00Z"}
+-->
+
+### Code Review | Round-1
+
+Found 3 issues:
+
+1. Missing error handling for OAuth callback (CLAUDE.md: "Always handle OAuth errors explicitly")
+
+https://github.com/owner/repo/blob/abc123def4567890123456789012345678901234/src/auth.ts#L67-L72
+
+2. Memory leak: OAuth state not cleaned up (bug: missing cleanup in finally block)
+
+https://github.com/owner/repo/blob/abc123def4567890123456789012345678901234/src/auth.ts#L88-L95
+
+3. Inconsistent naming pattern (AGENTS.md: "Use camelCase for all new functions")
+
+https://github.com/owner/repo/blob/abc123def4567890123456789012345678901234/src/utils.ts#L23-L28
+
+🤖 Generated with Kimi Code CLI
+```
+
+### 无问题时的输出（Round-1）
+
+```markdown
+<!-- kimi-cr-meta
+{"round":1,"pr_number":123,"head_sha":"abc123def4567890123456789012345678901234","previous_head_sha":null,"total_issues":0,"resolved_count":0,"new_count":0,"issues":[],"timestamp":"2026-04-21T10:00:00Z"}
+-->
+
+### Code Review | Round-1
+
+No issues found. Checked for bugs, CLAUDE.md and AGENTS.md compliance.
+
+🤖 Generated with Kimi Code CLI
+```
+
+### Round-2 增量审查输出（部分问题已修复，部分被 committer 拒绝修复）
+
+```markdown
+<!-- kimi-cr-meta
+{"round":2,"pr_number":123,"head_sha":"fed789abc0123456789012345678901234567890","previous_head_sha":"abc123def4567890123456789012345678901234","total_issues":1,"resolved_count":1,"acknowledged_count":1,"new_count":0,"issues":[{"id":"issue-2","description":"Daemon binds to localhost only, no auth needed","reason":"logic","file":"src/server.py","lines":"45-50","status":"open","first_round":1,"resolution":"acknowledged","committer_note":"daemon binds to localhost only, authentication not needed for local service"},{"id":"issue-3","description":"Memory leak: OAuth state not cleaned up","reason":"bug","file":"src/auth.ts","lines":"88-95","status":"open","first_round":1,"resolution":null,"committer_note":null}],"timestamp":"2026-04-21T10:30:00Z"}
+-->
+
+### Code Review | Round-2 (Re-check)
+
+Previous Round-1 issues: 3
+- **Resolved**: 1 (Missing error handling)
+- **Acknowledged / Won't Fix**: 1
+- **Still open**: 1
+
+New issues found: 0
+
+#### Acknowledged / Won't Fix
+
+2. Daemon binds to localhost only, no auth needed (committer: daemon binds to localhost only, authentication not needed for local service)
+
+#### Still Open from Round-1
+
+3. Memory leak: OAuth state not cleaned up (bug: missing cleanup in finally block)
+
+https://github.com/owner/repo/blob/fed789abc0123456789012345678901234567890/src/auth.ts#L88-L95
+
+🤖 Generated with Kimi Code CLI
+```
+
+### Round-3 全部修复输出
+
+```markdown
+<!-- kimi-cr-meta
+{"round":3,"pr_number":123,"head_sha":"aaa111bbb222333444555666777888999000aaaa","previous_head_sha":"fed789abc0123456789012345678901234567890","total_issues":0,"resolved_count":1,"new_count":0,"issues":[],"timestamp":"2026-04-21T11:00:00Z"}
+-->
+
+### Code Review | Round-3 (Re-check)
+
+Previous Round-2 issues: 1
+- **Resolved**: 1 (Memory leak)
+- **Still open**: 0
+
+New issues found: 0
+
+✅ **All issues resolved!**
+
+🤖 Generated with Kimi Code CLI
+```
+
+## 评论格式要求
+
+代码链接必须遵循以下精确格式，否则 GitHub Markdown 无法正确渲染：
+
+```
+https://github.com/owner/repo/blob/[full-sha]/path/file.ext#L[start]-L[end]
+```
+
+要求：
+- 使用完整 SHA（40 字符，不是缩写）
+- `#L` 表示行号
+- 行范围格式：`L[start]-L[end]`
+- 至少包含 1 行上下文（评论目标行的前后至少各 1 行）
+
+## 故障排除
+
+### 问题：无法获取 PR 信息
+
+**原因**：`gh` 未安装、未认证、或当前目录不在 Git 仓库中。
+
+**解决**：
+1. 运行 `gh --version` 确认已安装
+2. 运行 `gh auth status` 确认已认证
+3. 运行 `git remote -v` 确认有 GitHub remote
+
+### 问题：审查后没有发布评论
+
+**原因**：
+- PR 在审查过程中被关闭或合并（Step 7 拦截）
+- `gh pr review` 命令失败
+- PR 未通过资格审查
+
+**排查**：
+1. 检查终端输出中的资格审查结果
+2. 检查 Step 7 的输出
+3. 检查 `gh pr review` 是否有错误信息
+
+### 问题：Agent 输出格式错误
+
+**原因**：SubAgent 没有按要求输出 JSON。
+
+**解决**：
+- 在 prompt 中明确要求输出 JSON
+- 如果解析失败，忽略该 Agent 的输出，继续处理其他 Agent 的结果
+
+### 问题：代码链接无法点击
+
+**原因**：SHA 不完整、格式不正确、或行号计算错误。
+
+**解决**：
+- 确保使用 `gh pr view <PR> --json headRefOid --jq '.headRefOid'` 获取完整 40 字符 SHA
+- 确保格式严格为 `https://github.com/owner/repo/blob/[sha]/path#L[start]-L[end]`
+
+## 常见误报类型
+
+以下是审查 Agent 容易产生误报的场景，issue-validator 应特别注意识别：
+
+1. **原有问题**：问题在 PR 之前就已经存在，不是本次变更引入的
+2. **误读逻辑**：Agent 误解了代码的执行路径或条件分支
+3. **过度推断**：从代码中推导出了没有直接证据支持的结论
+4. **假设性问题**：基于某种假设场景（如极端输入）提出的问题
+5. **规范误用**：将不适用于当前代码类型的规范规则强加于此
+6. **上下文缺失**：由于未读取完整上下文而做出的错误判断
+
+## 性能说明
+
+- 5 个并行审查 Agent 可以同时运行，不受顺序依赖
+- Issue 验证 Agent 的数量取决于发现的问题数量，也可以并行执行
+- 大 PR 的审查时间可能较长，但并行架构可以充分利用并发能力
+- Step 3.5 的 Diff 预处理机制已处理超大 diff：过滤测试文件后通常减少 60-70%，4000 字符硬限制确保 prompt 不会触发 JSON 解析失败
+
+## 设计原理
+
+本 Skill 复刻 Claude Code 官方 code-review 插件的核心设计：
+
+1. **多 Agent 并行**：从不同角度独立审查，避免单一视角的盲区
+2. **冗余检查**：两个 CLAUDE.md checker 独立运行，通过交叉验证提高可靠性
+3. **Issue 验证**：每个发现的问题都经过独立验证，大幅降低误报率
+4. **HIGH SIGNAL**：只报告高置信度的问题，避免噪音淹没真正重要的问题
+5. **终端与 PR 同步**：终端输出和 PR 评论完全一致，确保透明性
+
+## 与其他工具的区别
+
+| 特性 | github-code-review-batch | 监听模式 CR | 本地 linter | 人工审查 |
+|------|-------------------------|-------------|-------------|---------|
+| 目标 | GitHub PR | GitHub PR | 本地代码 | GitHub PR |
+| 规范检查 | 支持 CLAUDE.md + AGENTS.md | 支持 CLAUDE.md + AGENTS.md | 不支持 | 依赖审查者记忆 |
+| 误报过滤 | 独立 issue 验证 | 独立 issue 验证 | 规则驱动 | 人工判断 |
+| 会话模型 | 短会话，调度器驱动 | 长会话 + background watcher | 半自动 | 手动 |
+| 状态持久化 | PR 评论 metadata | PR 评论 metadata + watcher 内存 | 无 | 人工记忆 |
+| 输出 | PR 评论 + 状态报告 | PR 评论 | 终端/CI | PR 评论 |
+
+## 最佳实践
+
+### 对于项目维护者
+
+1. **维护清晰的 CLAUDE.md 和 AGENTS.md**：明确的规范 = 更好的审查
+2. **定期更新规范**：根据反复出现的问题更新规范文件
+3. **将审查作为合并前的标准步骤**：在关键 PR 上运行此 Skill
+
+### 对于开发者
+
+1. **不要对 trivial PR 使用**：Skill 会自动跳过，无需手动触发
+2. **审查结果作为起点**：Agent 发现是起点，不是终点，仍需人工判断
+3. **积极反馈误报**：如果某类误报反复出现，更新规范文件或调整代码
+
+## 限制说明
+
+1. 本 Skill 仅支持 GitHub 仓库，不支持 GitLab、Bitbucket 等其他平台。
+2. 本 Skill 依赖 `gh` CLI，无法在没有安装 `gh` 的环境中运行。
+3. 对于极大的 PR（超过 1000 行变更），审查可能不够全面。
+4. 本 Skill 不能替代完整的测试套件和人工代码审查。
+5. 对于非代码文件的变更（如图片、二进制文件），无法进行有效审查。
+6. 本 Skill 不具备执行代码或运行测试的能力，仅进行静态分析。
+7. 本 Skill 为**非监听模式**，不启动 background watcher。多轮修复依赖外部调度器（如 zima daemon）交替调度 CR agent 和 fix agent。
+
+## 工具使用规范
+
+- **必须**使用 `Shell` 工具执行所有 `gh` 和 `git` 命令
+- **必须**使用 `Agent` 工具启动所有审查和验证 subagent
+- **禁止**提及或假设任何 MCP 工具（如 `pull_request_read`、`add_issue_comment`）
+- **禁止**创建 `scripts/` 目录或依赖外部资源文件
+- **禁止**使用 `task` 或其他非 `Agent` 方式启动 subagent
+
+## SubAgent Prompt 模板参考
+
+以下是各 SubAgent 的推荐 prompt 结构，执行时应根据实际输入填充具体内容：
+
+### claude-compliance-checker prompt 模板
+
+```
+你是一个代码规范审查员。你的任务是检查 PR 变更是否违反了 CLAUDE.md 中的规则。
+
+输入：
+- PR 摘要：{summary}
+- PR diff：{diff}
+- 相关 CLAUDE.md 内容：{claude_md_content}
+
+要求：
+1. 只关注 PR 修改的代码，忽略原有代码
+2. 尽量引用 CLAUDE.md 中的规则原文，但不要求一字不差；对于逻辑/安全问题，无需强制引用规范
+3. 不报告纯主观判断，但值得关注的逻辑缺陷和安全问题应当报告
+4. 输出 JSON 数组，每个元素包含 description、reason（必须包含 "CLAUDE.md"）、file、lines、suggestion
+5. 如果没有发现违规，输出空数组 []
+```
+
+### agents-compliance-checker prompt 模板
+
+```
+你是一个代码规范审查员。你的任务是检查 PR 变更是否违反了 AGENTS.md 中的规则。
+
+输入：
+- PR 摘要：{summary}
+- PR diff：{diff}
+- 相关 AGENTS.md 内容：{agents_md_content}
+
+要求：
+1. 只关注 PR 修改的代码，忽略原有代码
+2. 区分适用于代码审查的规则 vs 仅适用于编码行为的规则
+3. 尽量引用 AGENTS.md 中的规则原文，但不要求一字不差；对于逻辑/安全问题，无需强制引用规范
+4. 输出 JSON 数组，每个元素包含 description、reason（必须包含 "AGENTS.md"）、file、lines、suggestion
+5. 如果没有发现违规，输出空数组 []
+```
+
+### bug-scanner prompt 模板
+
+```
+你是一个 Bug 扫描器。你的任务是基于 diff 内容扫描 Bug 和潜在问题。
+
+输入：
+- PR diff（已过滤测试文件）：{diff}
+  注意：此 diff 已预先过滤掉 tests/、test/ 目录及测试文件（*_test.py、*_spec.py 等），以控制 prompt 长度。你只需关注业务代码中的 Bug。
+
+要求：
+1. 仅基于 diff 内容判断，不读取额外文件
+2. 报告所有潜在问题：编译错误、缺失导入、未解析引用、逻辑错误、空值处理、竞态条件、边界条件
+3. 忽略纯风格问题，但关注可能导致运行时错误的设计问题
+4. 对于不确定的问题仍然报告，在 description 中用 "Potential:" 或 "Possible:" 标注
+5. 输出 JSON 数组，每个元素包含 description、reason（必须为 "bug"）、file、lines、suggestion
+6. 如果没有发现 Bug，输出空数组 []
+```
+
+### logic-analyzer prompt 模板
+
+```
+你是一个逻辑和安全分析器。你的任务是分析变更代码的逻辑正确性和安全性。
+
+输入：
+- PR 摘要：{summary}
+- PR diff（已过滤测试文件）：{diff}
+  注意：此 diff 已预先过滤掉 tests/、test/ 目录及测试文件（*_test.py、*_spec.py 等），以控制 prompt 长度。你只需关注业务代码的逻辑和安全性问题。
+
+要求：
+1. 仅关注被修改的代码
+2. 关注资源泄漏、错误处理缺失、安全漏洞、竞态条件、边界条件、异常路径
+3. 对于依赖输入的潜在问题，如果代码没有做任何防御性处理，仍然值得报告
+4. 忽略纯风格问题和无明确对错的主观建议
+5. 输出 JSON 数组，每个元素包含 description、reason（"logic" 或 "security"）、file、lines、suggestion
+6. 如果没有发现问题，输出空数组 []
+```
+
+### issue-validator prompt 模板
+
+```
+你是一个 issue 验证器。你的任务是评估一个代码审查问题是否值得保留。
+
+输入：
+- 待验证 issue：{issue_json}
+- PR diff：{diff}
+- 相关规范文件内容：{guidelines}
+
+要求：
+1. 重新审视 issue 对应的目标代码
+2. 只有当 issue 明显是误读代码、或问题在变更前就已存在且 PR 并未触及、或规则引用完全不相关时，才标记 `"valid": false`
+3. 对于规范类 issue：规则不必一字不差引用，大意匹配即可
+4. 对于 bug 类 issue：不要因为不够"确定性"就过滤掉，只有完全假设性的场景才标记 invalid
+5. 输出 JSON：{"valid": boolean, "explanation": "string"}
+```
+
+### delta-reviewer prompt 模板
+
+```
+你是一个增量代码审查员。你的任务是对比上一轮发现的问题和当前 PR 的最新 diff，判断哪些问题已被修复，并发现新问题。
+
+输入：
+- PR 完整 diff：{diff}
+- 上一轮问题列表：{previous_issues}（每个 issue 可能含 resolution 和 committer_note 字段）
+- 上一轮 head SHA：{previous_head_sha}
+- 当前 head SHA：{current_head_sha}
+- 相关规范文件：{guidelines}
+
+要求：
+1. 优先处理带 committer 回应的 issues：
+   - resolution="acknowledged" / "wontfix" → 加入 acknowledged_issues，不再视为 open
+   - resolution="clarified"（有 committer_note）→ 结合澄清内容判断。如果澄清使 issue 失效，标记 resolved 并引用澄清；否则加入 unresolved_issues
+2. 遍历其余 previous issue（resolution 为 null），检查其 file + lines 范围是否在 diff 中被修改：
+   - 被修改 → 仔细阅读对应代码，判断是否已修复 → 加入 resolved_issues，附 resolution_note
+   - 未修改 → 加入 unresolved_issues
+3. 审查 diff 中其他新增/修改的代码，发现新问题 → 加入 new_issues
+   - **特别注意**：修复 commit 可能引入新的问题，不要只关注原有问题的修复状态
+   - 仔细审查修复代码本身的正确性
+4. 忽略已确认 resolved 的旧问题
+5. 对于规范类问题，确认规则是否仍适用于当前变更
+6. 输出 JSON：{"resolved_issues": [...], "acknowledged_issues": [...], "new_issues": [...], "unresolved_issues": [...], "pass": boolean}
+```
+
+## 审查结果示例解析
+
+### 有效 issue 示例
+
+```json
+{
+  "description": "函数返回了未初始化的变量，在错误路径中可能导致未定义行为",
+  "reason": "bug",
+  "file": "src/api/handlers.py",
+  "lines": "45-52",
+  "suggestion": "在错误路径中为 result 设置默认值或提前返回"
+}
+```
+
+### 无效 issue 示例（应被 validator 过滤）
+
+```json
+{
+  "description": "这个函数名不够描述性",
+  "reason": "CLAUDE.md",
+  "file": "src/utils.py",
+  "lines": "12-15",
+  "suggestion": "改为更具描述性的名字"
+}
+```
+过滤原因：CLAUDE.md 中并未明确规定函数命名的具体要求，属于主观判断。
+
+## 版本说明
+
+本 Skill 基于 `github-code-review`（监听模式）改编为**非监听模式**（Batch/Scheduled），主要变更包括：
+- **移除 background watcher**：不再启动长时间后台监控进程
+- **移除 re-entry 机制**：不再依赖 `<system-reminder>` 触发增量审查
+- **统一入口**：每次调用独立判断是首次审查还是增量审查（通过 metadata SHA 对比）
+- **新增状态报告**：每次结束输出机器可读的状态报告，供外部调度器消费
+- **完全兼容 metadata**：可读取监听模式 skill 发布的评论 metadata，反之亦然
+
+底层审查能力（多 Agent 并行、issue 验证、CLAUDE.md / AGENTS.md 检查等）与监听模式完全一致。
