@@ -71,19 +71,27 @@ review pull request owner/repo#101
 
 使用 `Shell` 执行：
 ```bash
-gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+gh pr view <PR> --json reviews \
+  --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'
 ```
 
-筛选 Kimi Code CLI 发布的 review 评论：
-1. 评论 body 包含 `"Generated with Kimi Code CLI"`
-2. 评论 body 包含 `"<!-- kimi-cr-meta"`
+此命令在 jq 内完成筛选（含 `"<!-- kimi-cr-meta"` 和 `"Generated with Kimi Code CLI"`）和排序（按 `submittedAt` 升序），直接返回最新一条 Kimi CR review 的完整 body。若返回 `empty`，表示无 previous review。
 
-按 `submitted_at` 排序，取最新一条。使用正则表达式提取 HTML Comment 中的 JSON metadata：
+使用正则表达式从返回的 body 中提取 HTML Comment 中的 JSON metadata：
 ```
 <!-- kimi-cr-meta\n(.*?)\n-->
 ```
 
 解析 metadata 字段：`round`, `head_sha`, `previous_head_sha`, `issues`。
+
+**调试输出**：提取 metadata 后，在终端打印：
+```
+[Step 0] Found previous review: Round-{round}, head_sha={head_sha}, submitted_at={submittedAt}
+```
+若未找到 previous review，打印：
+```
+[Step 0] No previous Kimi CR review found. Treating as Round-1.
+```
 
 #### 0.2a 读取并解析 committer 回应
 
@@ -765,9 +773,8 @@ reason 字段应为 "logic" 或 "security"。
 1. **Step 0: 审查类型判断**
    - 检查用户输入是否为 watcher 触发的 re-entry（`<system-reminder>` + "PR change watcher"）
    - 如果是 re-entry → 跳转至【Re-entry 处理】
-   - 否则：使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
-   - 筛选含 `"Generated with Kimi Code CLI"` 和 `"<!-- kimi-cr-meta"` 的评论
-   - 提取最新一轮的 JSON metadata
+   - 否则：使用 `Shell` 执行 `gh pr view <PR> --json reviews --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'` 获取最新一条 Kimi CR review
+   - 提取 JSON metadata
    - **执行 Step 0.2a**：使用 `gh pr view <PR> --comments` 获取所有评论，解析 committer 回应，更新 previous_issues
    - 对比 `previous_head_sha` 与当前 `headRefOid`
    - 无新 commit → 输出状态报告并结束（排除 acknowledged issues）
@@ -870,8 +877,8 @@ reason 字段应为 "logic" 或 "security"。
 
 1. 使用 `Shell` 执行 `gh pr view <PR> --json headRefOid,state` 确认当前 PR 状态
 2. 如果 `state` 为 `CLOSED` 或 `MERGED` → 输出 "PR already closed/merged" → 不启动 watcher → 结束
-3. 使用 `Shell` 执行 `gh pr view <PR> --json reviews` 获取 review 评论列表
-4. 筛选 Kimi CR 评论，提取最新一轮 metadata（同 Step 0.2）
+3. 使用 `Shell` 执行 `gh pr view <PR> --json reviews --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'` 获取最新一条 Kimi CR review
+4. 提取最新一轮 metadata（同 Step 0.2）
 5. 获取 `previous_issues` 列表和 `previous_head_sha`
 6. **执行 Step 0.2a**：使用 `gh pr view <PR> --comments` 获取所有评论，解析 committer 对 open issues 的回应，更新 `previous_issues` 的 `resolution` 和 `committer_note` 字段
 
@@ -1042,8 +1049,9 @@ gh pr view <PR> --json headRepositoryOwner,headRepository
 echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
 gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 
-# 获取 PR review 评论列表（含 review body 和提交时间）
-gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+# 获取最新一条 Kimi CR review（已在 jq 中完成筛选和排序）
+gh pr view <PR> --json reviews \
+  --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'
 
 # 获取 PR head commit SHA（用于对比是否有新 commit）
 gh pr view <PR> --json headRefOid --jq '.headRefOid'

@@ -71,19 +71,27 @@ scheduled review pr owner/repo#101
 
 使用 `Shell` 执行：
 ```bash
-gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+gh pr view <PR> --json reviews \
+  --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'
 ```
 
-筛选 Kimi Code CLI 发布的 review 评论：
-1. 评论 body 包含 `"Generated with Kimi Code CLI"`
-2. 评论 body 包含 `"<!-- kimi-cr-meta"`
+此命令在 jq 内完成筛选（含 `"<!-- kimi-cr-meta"` 和 `"Generated with Kimi Code CLI"`）和排序（按 `submittedAt` 升序），直接返回最新一条 Kimi CR review 的完整 body。若返回 `empty`，表示无 previous review。
 
-按 `submitted_at` 排序，取最新一条。使用正则表达式提取 HTML Comment 中的 JSON metadata：
+使用正则表达式从返回的 body 中提取 HTML Comment 中的 JSON metadata：
 ```
 <!-- kimi-cr-meta\n(.*?)\n-->
 ```
 
 解析 metadata 字段：`round`, `head_sha`, `previous_head_sha`, `issues`。
+
+**调试输出**：提取 metadata 后，在终端打印：
+```
+[Step 0] Found previous review: Round-{round}, head_sha={head_sha}, submitted_at={submittedAt}
+```
+若未找到 previous review，打印：
+```
+[Step 0] No previous Kimi CR review found. Treating as Round-1.
+```
 
 #### 0.2a 读取并解析 committer 回应
 
@@ -948,8 +956,9 @@ gh pr view <PR> --json headRepositoryOwner,headRepository
 echo "<review_body>" > /tmp/kimi-cr-{pr_number}.md
 gh pr review <PR> --comment --body-file /tmp/kimi-cr-{pr_number}.md
 
-# 获取 PR review 评论列表（含 review body 和提交时间）
-gh pr view <PR> --json reviews --jq '.reviews[] | {body: .body, submitted_at: .submitted_at}'
+# 获取最新一条 Kimi CR review（已在 jq 中完成筛选和排序）
+gh pr view <PR> --json reviews \
+  --jq '[.reviews[] | select(.body // "" | contains("<!-- kimi-cr-meta") and contains("Generated with Kimi Code CLI"))] | sort_by(.submittedAt) | last // empty'
 
 # 获取 PR head commit SHA（用于对比是否有新 commit）
 gh pr view <PR> --json headRefOid --jq '.headRefOid'
